@@ -91,6 +91,7 @@ def ensure_certs(cfg: Config, force: bool = False) -> dict:
         "ca": d / "ca.pem",
         "ca_key": d / "ca.key",
         "server": d / "server.pem",
+        "server_leaf": d / "server_leaf.pem",
         "server_key": d / "server.key",
     }
     if not force and all(p.exists() for p in paths.values()):
@@ -150,7 +151,10 @@ def ensure_certs(cfg: Config, force: bool = False) -> dict:
     pem = serialization.Encoding.PEM
     paths["ca"].write_bytes(ca_cert.public_bytes(pem))
     paths["ca_key"].write_bytes(_pem_key(ca_key))
-    # server.pem = leaf + CA, so clients that want the chain get it
+    # server.pem = leaf + CA (full chain); server_leaf.pem = leaf only. Some old ProtoSSL clients
+    # apparently only expect the leaf and choke on an extra (self-signed, so pointless to them
+    # anyway) CA certificate in the handshake -- try both against the real client.
     paths["server"].write_bytes(srv_cert.public_bytes(pem) + ca_cert.public_bytes(pem))
+    paths["server_leaf"].write_bytes(srv_cert.public_bytes(pem))
     paths["server_key"].write_bytes(_pem_key(srv_key))
     return paths

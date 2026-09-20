@@ -38,6 +38,8 @@ def cmd_run(args) -> int:
         cfg.blaze_secure = args.secure == "1"
     if args.bind:
         cfg.bind_address = args.bind
+    if args.no_chain:
+        cfg.cert_send_chain = False
     ensure_certs(cfg)
     ctx = make_tls_context(cfg)
     rsrv = Server("redirector", cfg.bind_address, cfg.redirector_port,
@@ -82,6 +84,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("run", help="start redirector + capture probe")
     p.add_argument("--secure", choices=["0", "1"], help="advertise plain (0) or TLS (1) main connection")
     p.add_argument("--bind", help="interface to listen on (default from config)")
+    p.add_argument("--no-chain", action="store_true",
+                    help="send only the leaf certificate, not leaf+CA (some old TLS stacks "
+                         "choke on the extra self-signed CA cert)")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("analyze", help="inspect a captured *_c2s.bin file")

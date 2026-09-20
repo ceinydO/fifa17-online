@@ -64,7 +64,8 @@ def make_tls_context(cfg: Config) -> ssl.SSLContext:
     except (ValueError, ssl.SSLError):
         pass
     d = cfg.cert_dir_path
-    ctx.load_cert_chain(certfile=str(d / "server.pem"), keyfile=str(d / "server.key"))
+    cert_name = "server.pem" if cfg.cert_send_chain else "server_leaf.pem"
+    ctx.load_cert_chain(certfile=str(d / cert_name), keyfile=str(d / "server.key"))
     return ctx
 
 

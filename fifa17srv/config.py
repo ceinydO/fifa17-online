@@ -28,6 +28,7 @@ class Config:
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
     cert_sig_hash: str = "sha256"  # "sha1" may be needed for very old TLS stacks
+    cert_send_chain: bool = True  # False sends only the leaf cert, not leaf+CA
     idle_timeout: float = 60.0
 
     @property
