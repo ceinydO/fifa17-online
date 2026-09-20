@@ -22,9 +22,11 @@ Start FIFA 17 now. Press Ctrl+C to stop.
 
 def cmd_certs(args) -> int:
     cfg = load_config()
-    if args.sha1:
+    if args.protossl_bypass:
+        cfg.cert_sig_hash = "protossl-bypass"
+    elif args.sha1:
         cfg.cert_sig_hash = "sha1"
-    paths = ensure_certs(cfg, force=args.force or args.sha1)
+    paths = ensure_certs(cfg, force=args.force or args.sha1 or args.protossl_bypass)
     for name, p in paths.items():
         print(f"{name:11s} {p}")
     return 0
@@ -71,6 +73,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("certs", help="generate local CA + server certificate")
     p.add_argument("--force", action="store_true", help="regenerate even if present")
     p.add_argument("--sha1", action="store_true", help="sign with SHA-1 (for very old TLS stacks)")
+    p.add_argument("--protossl-bypass", action="store_true",
+                    help="sign with a bogus algorithm OID that trips the old EA ProtoSSL "
+                         "cert-verify bug (Aim4kill/Bug_OldProtoSSL); try this if --sha1 "
+                         "doesn't get past ClientHello->ServerHelloDone")
     p.set_defaults(fn=cmd_certs)
 
     p = sub.add_parser("run", help="start redirector + capture probe")

