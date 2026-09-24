@@ -400,25 +400,170 @@ reference tracing, or capturing a different client flow that might reference it 
 5. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
    encoder output line by line, rather than trusting the Python field-list source.
 
+**Update 2026-09-24 (new session, PS3-side/binary-patch angle instead of Blaze-wire angle):**
+this update is about the *exact same* "RE-CONNECT"/frozen-spinner blocker described above, but
+approached from RPCS3-native-log + PS3-binary-patching instead of Blaze wire captures. Both symptom
+descriptions ("Loading Seasons information...", "PRESS THE START BUTTON TO RE-CONNECT") are the
+same underlying freeze; Play Cup Match and Play Season both exhibit it.
+
+**Critical infrastructure discovery: how this user's RPCS3 actually boots the game.** The user's
+RPCS3 does **not** boot `C:\fifa17-ps3\EBOOT.ELF` directly — it boots from an **ISO**
+(`C:/rcps3/games/FIFA 17 (Europe) (En,Fr,De,Es,It,Nl,Pt,Sv,No,Da,Pl,Ru).iso`), with
+`Elf path: /dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN` inside it (confirmed via `Elf path:` /
+`Booting from gamelist...` lines in `RPCS3.log`). **Any direct byte-patch to the standalone
+`C:\fifa17-ps3\EBOOT.ELF` file has zero effect on actual gameplay** — this was tried and confirmed
+useless this session (a verified-correct byte patch produced no behavior change at all). Disc
+serial (confirmed via `Serial:` lines in `RPCS3.log`, do not confuse with the `UP0006-BLUS31543_00`
+/`UP0006-BLUS31593_00` strings seen in NP ticket/commerce calls, which are unrelated EA network
+service IDs): **BLES02233**, version **01.00** (European edition).
+
+**The correct way to apply a binary patch: RPCS3's Patch Manager (`patch.yml`).** Location on this
+user's machine: `C:\rcps3\patches\patch.yml` (NOT `C:\rcps3\patch.yml` — confirmed by the user).
+RPCS3 applies patches from this file to the executable **in memory at runtime**, keyed by PPU
+executable hash + game title + serial + version, independent of which file on disk actually gets
+booted — this is why it works where the direct file patch didn't. Confirmed working syntax (there
+were already two working patches in the file under the same key when this session started, used as
+the template):
+```yaml
+Version: 1.2
+PPU-1243af2b292938038cdc3696755e82477122db3b:
+  <Patch Name>:
+    Games:
+      FIFA 17:
+        BLES02233: [ "01.00" ]
+    Author: "custom"
+    Notes: "..."
+    Patch Version: "1.0"
+    Patch:
+          - [ be32, 0x<VA_hex>, 0x<value_hex> ]
+```
+Addresses are **VAs** (virtual addresses), same addressing scheme as everywhere else in this
+project's disassembly work — not raw file offsets. New patches must be inserted as a new key under
+the *same* `PPU-<hash>:` parent key (regex-insert before an existing sibling patch entry works
+fine), and get picked up automatically by RPCS3's Patch Manager GUI (`FIFA 17 > BLES02233 v.01.00`)
+without needing a restart — just enable the new patch's checkbox and relaunch the game.
+
+**Patch #1 applied and confirmed effective: `NEW_THREAD_FOR_FE_INIT_STAGE3` default-value flip.**
+Function `0x005C2BB8`-`0x005C2D44` gates creation of the "FIFA FE Second Initial Thread" (whose
+endless recreation loop was the symptom investigated in earlier sessions) behind a config flag
+whose *default* value (used when the key isn't found in an internal typed config store) is set by
+`li r5, 1` (`38 A0 00 01`) at VA `0x005C2C10`. Patched via `patch.yml`:
+```yaml
+  Disable NEW_THREAD_FOR_FE_INIT_STAGE3 default (force off):
+    Games:
+      FIFA 17:
+        BLES02233: [ "01.00" ]
+    Author: "custom"
+    Notes: "li r5,1 -> li r5,0 at 0x005C2C10, forces NEW_THREAD_FOR_FE_INIT_STAGE3 default to off"
+    Patch Version: "1.0"
+    Patch:
+          - [ be32, 0x005C2C10, 0x38A00000 ]
+```
+**Confirmed effective**: after enabling this patch, `"FIFA FE Second Initial Thread"` no longer
+appears **anywhere** in `RPCS3.log` during a full Cup Match/Play Season test — the first time in
+the whole multi-session debugging effort this specific thread-creation loop has been eliminated.
+**However, the on-screen symptom is unchanged** ("same as before" per user) — a *different*
+mechanism has taken over the freeze.
+
+**New blocker mechanism found: repeating "MoviePlayer2 Decode Thread" creation, NOT an actual
+movie player.** There are two distinct things sharing this thread name in the log, easy to
+conflate:
+- A **real, legitimate** MoviePlayer2 thread (id `0x1000027`) plays the boot intro
+  (`/dev_bdvd/PS3_GAME/USRDIR/data/movies/bootflowintro_MARKER.vp6`), reads real file data over
+  ~3 seconds, and exits cleanly — log even shows `"PS3Shutdown, Movie player complete"` at the very
+  end. **This is not the bug.**
+- Starting **~2 seconds after** `cellGameDataCheck(): directory '/dev_hdd0/game/BLUS31543' not
+  found` fails (this specific error has appeared in every test run all session, previously
+  deprioritized), `FEThread` begins creating a new thread **every ~10.00-10.02 seconds, on the
+  clock**, until the user closes the game window. These loop-threads do **no file I/O at all** —
+  they're created, immediately do one `sys_mutex_unlock`, and exit in under 1ms. The
+  "MoviePlayer2 Decode Thread" name on these is almost certainly a stale/reused thread-name-pointer
+  artifact in RPCS3's thread-naming, not an actual video decoder — this is a generic polling/retry
+  loop, structurally identical in behavior (fixed-interval, no-op, endless) to the now-fixed
+  `FIFA FE Second Initial Thread` loop, just via a different code path.
+- **Ruled out: not waiting on the network.** The `fifa17srv` console log for the same run shows the
+  client closing its own Blaze TCP connection (`client closed the connection`) only ~19s after the
+  last frame-level ping, with no further requests sent. RPCS3-log-side `sys_net_bnet_*` activity in
+  the loop's time window is just polling an already-idle/closed socket. So whatever the 10-second
+  loop is waiting for, it is **not** an unanswered Blaze request — it's a purely local/PS3-side
+  wait (or a fixed timeout unrelated to any reply).
+- **Tried, not yet verified live:** built and installed a synthetic `PARAM.SFO` at
+  `C:\rcps3\dev_hdd0\game\BLUS31543\PARAM.SFO` (that directory existed on disk already but was
+  completely empty — that's why `cellGameDataCheck` reported "not found"). Minimal PSF with keys
+  `APP_VER=01.00`, `ATTRIBUTE=0` (int32), `CATEGORY=HG`, `PARENTAL_LEVEL=0` (int32),
+  `TITLE=FIFA 17`, `TITLE_ID=BLUS31543`, `VERSION=01.00`. **`CATEGORY=HG` is a guess** — PS3
+  category codes for this kind of supplementary/HDD game-data folder could plausibly also be `GD`;
+  if this fix has no effect, try `GD` next before abandoning the idea. Built via a PowerShell script
+  in this session's transcript (constructs the PSF header/index-table/key-table/data-table
+  programmatically with correct offset math — regenerate from that script rather than hand-editing
+  bytes if the category needs to change). **Not yet retested against a fresh RPCS3.log at the time
+  of this README update** — next session should check whether (a) the "not found" message is gone
+  and (b) the 10-second retry loop stopped.
+- Given the loop isn't network-related, if the PARAM.SFO fix doesn't resolve it, the next lead
+  should probably be identifying what specifically `FEThread` is polling for every 10 seconds —
+  i.e., finding the actual calling function around the thread-creation call site (`func=*0xd9018`
+  is a generic thread-trampoline, not useful on its own) via `find_callers.py` against whatever
+  function issues these `_sys_ppu_thread_create` calls from `FEThread`, once that call site's VA is
+  identified from a fresh disassembly pass.
+
 ## Reverse-engineering toolchain
 
 The PS3 EBOOT.ELF static-analysis scripts (`find_str_refs.py`, `find_cmd_consts.py`,
 `find_cmd_names.py`, `find_requests.py`, `disasm_range.py`, `dump_words.py`,
-`find_tdf_members.py`, ...) used to derive the confirmed facts above **are not part of this git
-repository** — they live only on the Windows machine where the actual RE work happens, alongside
-the (not-redistributed) EBOOT.ELF itself. If starting a fresh session without that context, ask
-the user to run the relevant tool and paste its output rather than assuming the tools are
-available locally; each tool prints its own usage/docstring on `--help` or bad args, which is more
-reliable than remembering exact flags from a previous session.
+`find_tdf_members.py`, `find_callers.py`, ...) used to derive the confirmed facts above **are not
+part of this git repository** — they live only on the Windows machine where the actual RE work
+happens, alongside the (not-redistributed) EBOOT.ELF itself. If starting a fresh session without
+that context, ask the user to run the relevant tool and paste its output rather than assuming the
+tools are available locally; each tool prints its own usage/docstring on `--help` or bad args,
+which is more reliable than remembering exact flags from a previous session.
+
+- `find_callers.py <eboot.elf> <target_hex_va>`: dependency-free (no capstone), finds all `bl`/`b`
+  instructions in `.text` whose branch target resolves to the given VA, by parsing ELF64 PT_LOAD
+  program headers for VA↔file-offset mapping and decoding just the PPC primary-opcode-18 branch
+  instruction. Useful for "who calls this function" when a targeted xref search is needed and
+  heavier disassembly tooling is unavailable/slow. Confirmed working: found 9 callers of the config
+  lookup function `0x143C4B8`; found 0 callers of `0x143C9D8` (a setter only reached indirectly via
+  function pointer/vtable — a dead end for this specific technique, not a bug in the script).
+
+**PS3 ELF VA↔file-offset mapping, important recurring gotcha:** this EBOOT's first (and largest)
+`PT_LOAD` segment has `vaddr - file_offset = 0x10000` (confirmed via program headers: `phoff=0x40`,
+`phentsize=56`, `phnum=8`, two real `PT_LOAD` segments sharing that same `0x10000` delta, plus
+three degenerate zero-size `PT_LOAD` entries to ignore). A raw file-offset hit from a byte-level
+scan is **not** the same as the VA that `disasm_range.py`/patch.yml/etc. expect — always add
+`0x10000` and verify with `disasm_range.py` before trusting or acting on a raw-offset search hit.
+(This bit this project once already: two apparent `li r4, 0x8C9` hits at raw offsets
+`0x0030AA08`/`0x0030AAEC` turned out to be false positives on reinspection after correction.)
 
 Known paths on the user's Windows machine (confirmed, not guessed -- ask the user to re-confirm
 if a command against one of these fails, since setups can change):
 - RE tool scripts: `C:\fifa17-friendlies-git\fifa17srv\` (run scripts from here, e.g.
   `python find_requests.py ...`)
-- EBOOT.ELF: `C:\fifa17-ps3\EBOOT.ELF`
+- EBOOT.ELF (standalone file, disassembly target — **but NOT what RPCS3 actually boots**, see
+  below): `C:\fifa17-ps3\EBOOT.ELF`
+- **What RPCS3 actually boots**: an ISO,
+  `C:/rcps3/games/FIFA 17 (Europe) (En,Fr,De,Es,It,Nl,Pt,Sv,No,Da,Pl,Ru).iso`, with
+  `Elf path: /dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN` inside it. A byte-patch to the standalone
+  `C:\fifa17-ps3\EBOOT.ELF` above has **no effect on gameplay** — confirmed this session. Use
+  RPCS3's Patch Manager (`patch.yml`, below) for any patch meant to actually change behavior.
 - RPCS3 install root: `C:\rcps3` (note the transposed letters, that's the real path). Native/HLE
   log: `C:\rcps3\log\RPCS3.log` (several MB, grep it rather than pasting whole). TTY log (game's
   own stdout/stderr, much smaller): `C:\rcps3\log\TTY.log`.
+- RPCS3 Patch Manager database: `C:\rcps3\patches\patch.yml` (**not** `C:\rcps3\patch.yml` — a
+  previous session guessed wrong, user corrected it). Applies `be32` (and other) in-memory patches
+  keyed by PPU hash + game/serial/version, regardless of which file RPCS3 actually booted from.
+  See the "Patch Manager" writeup in the "Current blocker" section above for exact working YAML
+  syntax and a confirmed-effective example patch.
+- RPCS3 patch-manager config (separate from `patches/`): `C:\rcps3\config`
+- RPCS3 virtual filesystem root: `C:\rcps3\dev_hdd0`. Game-data-check directories live under
+  `C:\rcps3\dev_hdd0\game\<DIRNAME>\` (e.g. `BLUS31543` — already existed as an empty dir this
+  session, which is why `cellGameDataCheck` reported "not found"; needs a valid `PARAM.SFO` inside
+  to be recognized). Savedata (useful as a real PARAM.SFO reference/template for the PSF binary
+  format) lives under `C:\rcps3\dev_hdd0\home\00000001\savedata\<TITLE_ID+NN>\PARAM.SFO`, e.g.
+  `C:\rcps3\dev_hdd0\home\00000001\savedata\BLES022330000\PARAM.SFO`.
+- Confirmed disc serial: **BLES02233** (European edition), version **01.00** — found via `Serial:`
+  lines in `RPCS3.log`. Do not confuse with `UP0006-BLUS31543_00`/`UP0006-BLUS31593_00` strings
+  seen in NP ticket/commerce API calls elsewhere in the log — those are unrelated internal EA
+  network service identifiers, not the disc serial.
 
 Reference implementation used for cross-checking tag names / command numbers / TDF field layouts:
 `github.com/Mk0M/Impulsum14` — an open-source, from-scratch C# Blaze backend for **FIFA 14 PC**
