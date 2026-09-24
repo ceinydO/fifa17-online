@@ -506,6 +506,41 @@ conflate:
   function issues these `_sys_ppu_thread_create` calls from `FEThread`, once that call site's VA is
   identified from a fresh disassembly pass.
 
+**Update 2026-09-25: PARAM.SFO fix retested live — RULES OUT the BLUS31543/GameDataCheck theory
+entirely.** With the synthetic `PARAM.SFO` in place (RPCS3's game list now shows a second row,
+`FIFA 17 / BLUS31543 / HDD Game / 01.00 / 248.00 B`, confirming the PSF parses correctly), a fresh
+Play Season test shows:
+
+- `cellGameDataCheck(type=3, dirName="BLUS31543", ...)` now fails with a **real, specific** error
+  instead of "not found": `'cellGameDataCheck' failed with 0x8002cb05 : psf::error='OK',
+  type='3' CATEGORY='HG'`. This confirms the PSF is read successfully, but **`CATEGORY=HG` is the
+  wrong category for whatever `type=3` expects** (our earlier guess was wrong; `GD` or another code
+  may be correct for type 3 specifically — not yet tried).
+- The client **immediately retries with `type=2`** on the same `dirName`, and **that one succeeds**
+  — category `HG` is apparently correct for `type=2` (plausibly `CELL_GAME_GAMETYPE_HDD`). It then
+  proceeds to `cellGameContentPermit` and `sys_fs_opendir("/dev_hdd0/game/BLUS31543/USRDIR/dime")`
+  (a `USRDIR/dime` subfolder we never created — this whole exchange looks like a DIME
+  [likely some kind of live-content/roster-update check] probe, most likely unrelated to Play
+  Season/Cup Match itself).
+- **Despite `type=2` now succeeding, the 10-second "MoviePlayer2 Decode Thread" retry loop occurred
+  completely unchanged** — same fixed ~10.00-10.02s cadence (5 iterations logged before the user
+  closed the game), same no-op thread bodies, and **the user confirmed "w grze się nic nie
+  zmieniło" (nothing changed on screen)**. This is strong evidence the loop was **never actually
+  gated by the BLUS31543 GameDataCheck outcome** — the correlation observed in the previous test
+  was coincidental timing, not causal. **Do not keep chasing this lead**; the PARAM.SFO
+  fix can stay in place (it's more correct than an empty directory regardless, and may matter for
+  other things later), but it is confirmed **not** the fix for the freeze.
+- This pushes the investigation back to the already-documented Blaze-level "RE-CONNECT" blocker
+  (see the main "Current blocker" section above) — the 10s loop is most plausibly the client's own
+  reconnect-retry/watchdog mechanism for the same freeze, just observed from the PS3-native-log
+  side instead of the Blaze-wire side. **Next concrete step, not yet tried:** use **RPCS3's
+  built-in debugger** (View/Tools → Debugger in the RPCS3 GUI) to pause emulation right as `FEThread`
+  creates one of these loop threads and read its **live call stack** — this gives the actual
+  calling function's return address directly, without needing to guess or brute-force scan for it
+  statically (raw `sys_ppu_thread_create` syscalls don't log an `LR:`/`HLE:` caller annotation the
+  way `cellGame`/`cellSysmodule` HLE-wrapped calls do, so static `find_callers.py`-style tracing
+  has no good starting VA for this specific loop yet — the debugger sidesteps that entirely).
+
 ## Reverse-engineering toolchain
 
 The PS3 EBOOT.ELF static-analysis scripts (`find_str_refs.py`, `find_cmd_consts.py`,
