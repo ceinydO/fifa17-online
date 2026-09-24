@@ -359,6 +359,24 @@ Also ran `disasm_range.py` over `0x00C92300`-`0x00C92600`, confirming the GameMa
 string pointer — this is purely a name-lookup table (probably for logging/asserts), not evidence
 of the RPC path being invoked. No new leads from this.
 
+**Tried and inconclusive: literal search for component `0x08C9` as an `li`/`ori` immediate.**
+Computed the PPU opcodes for `li rX,0x8C9` / `ori rX,r0,0x8C9` for X=3..10 and scanned the raw
+EBOOT.ELF bytes. Important gotcha: raw file offsets are NOT the same as the virtual addresses
+`disasm_range.py` takes — this EBOOT's first (and largest) `PT_LOAD` segment has
+`vaddr - offset = 0x10000`, so a raw byte-search hit at file offset `X` corresponds to VA
+`X + 0x10000` (confirmed via the ELF program headers: `phoff=0x40`, `phentsize=56`, `phnum=8`,
+two real `PT_LOAD` segments both with that same `0x10000` delta, plus three degenerate
+zero-size `PT_LOAD` entries to ignore). After correcting for this, found one genuine `li r4,
+0x8C9` at VA `0x002991E0`, but it's followed by `bl 0x01A148A0` — not the known Blaze send
+function (`0x00CFAD54`) — so it doesn't look related. Two other raw-offset hits
+(`0x0030AA08`/`0x0030AAEC` → corrected VA `0x0030BA08`/`0x0030BAEC`) turned out to be false
+positives on reinspection (the bytes at the corrected VA are not `38 80 08 C9` at all — likely a
+bug in the ad-hoc scan script from this session, not re-derived). **Do not trust file-offset hits
+from a quick byte-scan without applying the `+0x10000` VA correction and verifying with
+`disasm_range.py` before acting on them.** This technique did not find component `0x08C9`'s
+load site; abandon it in favor of a different approach (e.g. `find_str_refs.py`-style TOC/pointer
+reference tracing, or capturing a different client flow that might reference it more directly).
+
 **Next investigation ideas, in rough priority order:**
 
 1. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
