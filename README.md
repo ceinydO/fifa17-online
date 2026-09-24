@@ -295,6 +295,21 @@ otherwise unchanged. Don't retry this specific value swap; if NAT-type theories 
 the fact that `NATT` shifted 1→4 for a firetype 2→0 change is worth using to reverse-engineer what
 the field actually encodes before guessing another value blindly.
 
+**Tried and disproven:** `build_ext_data_update()` used to send `ADDR` as `UNSET` in the
+`UserSessionExtendedDataUpdate` notification that follows `updateNetworkInfo`, even though the
+client's own `updateNetworkInfo` request always shows `EXIP` as all-zero (it doesn't know its own
+external address and appears to be asking for it back). Changed it to send a real
+`NetworkAddress::IpPairAddress` (union disc=2, tag `VALU`, fields `EXIP`/`INIP`/`MACI` — shape
+confirmed on the wire from the client's own request) echoing back the client's reported local
+`INIP`/`MACI`/`PORT` as both `EXIP` and `INIP` (everything is loopback here, so "external" ==
+"internal"). **This worked exactly as designed and is worth keeping**: the very next
+`updateNetworkInfo` the client sends shows `EXIP: IP=127.0.0.1, PORT=3659` — the client accepted
+and echoed back exactly the address we gave it. But the Cup Match freeze was **still unaffected**:
+identical "Loading Seasons information..." hang immediately after. So a missing/unset session
+address was not the (sole) gate either. Keep this fix (it's more correct than `UNSET` regardless,
+and future components may depend on it), but stop looking at `UserSessionExtendedData`'s `ADDR`
+field as the blocker.
+
 **Next investigation ideas (not yet tried), in rough priority order:**
 
 1. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
