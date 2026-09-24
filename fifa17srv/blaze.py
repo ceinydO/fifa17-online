@@ -73,6 +73,7 @@ LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND = 0x0032
 # z tym, co realnie przyszlo od klienta (0x04/0x0F/0x10), a pola GetStatsByGroupRequest (EID/NAME/PCTR/POFF/
 # PTYP/TIME/VID) pasuja do przechwyconego zadania.
 STATS_COMPONENT = 0x0007
+GET_STAT_GROUP_COMMAND = 0x0004                    # StatsComponentCommand.getStatGroup = 4
 GET_STATS_BY_GROUP_ASYNC_COMMAND = 0x0010          # StatsComponentCommand.getStatsByGroupAsync = 16
 GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.GetStatsAsyncNotification = 50
 
@@ -298,6 +299,24 @@ def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
     return build_notification(STATS_COMPONENT, GET_STATS_ASYNC_NOTIFICATION, payload)
 
 
+def build_stat_group_response(component: int, command: int, msg_num: int, group_name: str) -> bytes:
+    """Blaze::Stats::StatGroupResponse -- odpowiedz na getStatGroup (0x0007/0x0004), ksztalt potwierdzony
+    w Impulsum14 (Blaze3SDK/Blaze/Stats/StatGroupResponse.cs). Pusta lista StatDescs -- nie mamy zadnych
+    prawdziwych definicji statystyk, wysylamy tylko szkielet z poprawna nazwa grupy, zeby klient mial co
+    powiazac z pozniejsza notyfikacja GetStatsAsyncNotification."""
+    fields = [
+        ("CNAM", tdf.STRING, ""),
+        ("DESC", tdf.STRING, ""),
+        ("ETYP", tdf.OBJTYPE, (0, 0)),
+        ("KSUM", tdf.MAP, (tdf.STRING, tdf.VARINT, [])),
+        ("META", tdf.STRING, ""),
+        ("NAME", tdf.STRING, group_name),
+        ("STAT", tdf.LIST, (tdf.STRUCT, [])),
+    ]
+    payload = tdf.encode(fields)
+    return build_reply(component, command, msg_num, payload)
+
+
 def build_get_account_response(component: int, command: int, msg_num: int, identity) -> bytes:
     """Odpowiedz na Authentication::getAccount. Typ Blaze::Authentication::AccountInfo, 16 pol (definicja
     z EBOOT, funkcja 0x00C75874). Nie znaleziono kodu budujacego prawdziwa odpowiedz (funkcja pod jedynym
@@ -508,6 +527,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
         stream.settimeout(cfg.idle_timeout)
         buf = b""
         identity = None            # (nazwa, EXTI, EXTB) z ostatniego login -- do powiadomien o uzytkowniku
+        last_stat_group = ""       # NAME z ostatniego Stats::getStatGroup -- getStatsByGroupAsync przychodzi
+                                    # z pustym NAME, ale odpowiedz-powiadomienie musi miec prawdziwa nazwe grupy
         while True:
             try:
                 chunk = stream.recv(65536)
@@ -590,16 +611,25 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
                              f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
-                elif component == STATS_COMPONENT and command == GET_STATS_BY_GROUP_ASYNC_COMMAND:
-                    group_name, view_id = "", 0
+                elif component == STATS_COMPONENT and command == GET_STAT_GROUP_COMMAND:
+                    group_name = ""
                     for tag, t, v in fields:
                         if tag == "NAME":
+                            group_name = v
+                    last_stat_group = group_name
+                    resp = build_stat_group_response(component, command, msg_num, group_name)
+                    cap.note(f"-> wysylam Stats::StatGroupResponse dla grupy={group_name!r} "
+                             f"(Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                elif component == STATS_COMPONENT and command == GET_STATS_BY_GROUP_ASYNC_COMMAND:
+                    group_name, view_id = last_stat_group, 0
+                    for tag, t, v in fields:
+                        if tag == "NAME" and v:
                             group_name = v
                         elif tag == "VID":
                             view_id = v
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> odpowiadam pusto na Stats::getStatsByGroupAsync (msg_num={msg_num}), "
-                             f"grupa={group_name!r}")
+                             f"grupa={group_name!r} (z ostatniego getStatGroup)")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
                                     build_stats_async_notification(group_name, view_id)))
                 else:
