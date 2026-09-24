@@ -506,6 +506,47 @@ conflate:
   function issues these `_sys_ppu_thread_create` calls from `FEThread`, once that call site's VA is
   identified from a fresh disassembly pass.
 
+**Update 2026-09-25 (later in the same session): the "10-second loop" is NOT a fixed-interval
+timer — it's a reconnect cycle, and it correlates directly with the client's own Blaze
+reconnection attempts.** Listing every `"MoviePlayer2 Decode Thread"` creation across a *full* log
+(not just a narrow window) showed irregular gaps: 14.7s → 31.9s → 10.0s → **4 minutes 55 seconds**.
+The user confirmed they were sitting completely idle on the frozen Play Season screen (with music
+still playing) for the entire run — no input, no navigation. So the irregular timing isn't
+UI-navigation-driven either.
+
+Cross-referencing against the matching `fifa17srv` console log (wall-clock) for the same run
+revealed the real cause: **the client closes and fully reopens its own Blaze connection
+periodically, doing a complete redirector→login→QoS handshake from scratch each time**:
+- Connection #1: opened, alive ~59s, closed.
+- Gap: 4 min 46s.
+- Connection #2: fully reconnects (fresh redirector/PreAuth/login/QoS sequence), alive with real
+  traffic ~8s, one more frame-level ping 35s later, then closes after another ~5 min 05s of
+  silence.
+
+This **4:46 gap between the server-side close and reconnect** lines up almost exactly with the
+**4:55 gap** between the 3rd and 4th `MoviePlayer2 Decode Thread` creations in the RPCS3-side
+timeline for the same run. This confirms the thread-creation loop is not a fixed poll timer or
+generic engine thread pool — **it's tied to the client's own automatic Blaze-reconnect cycle**,
+and the `0xA46528` status-check function found via the live debugger (see above) is plausibly part
+of that reconnect state machine after all.
+
+**This is the key strategic finding of this whole session**: the client performs a **complete,
+successful** Blaze handshake (redirector, PreAuth, login, full Stats burst, QoS, updateNetworkInfo)
+on every single reconnect attempt — our server implementation is not rejecting it or erroring out.
+It just never receives whatever it's actually waiting for to leave the frozen screen, so after a
+timeout it gives up, waits several minutes, and tries the whole handshake again from scratch. This
+**fully validates the original Blaze-level analysis** in the main "Current blocker" section above
+(component `0x08C9` never identified, GameManager never invoked, the "waiting for a Notification
+we never send" theory) and **invalidates** this session's PS3-side detour as the fix — the
+PARAM.SFO/patch.yml/GameDataCheck work was not wasted (it correctly eliminated one real bug, the
+old `FIFA FE Second Initial Thread` loop, and produced reusable tooling/technique), but the actual
+blocker lives in the Blaze protocol layer, not in PS3-side binary patches or game-data files.
+**Next session should return to the Blaze-level investigation ideas listed above** (identifying
+component `0x08C9`, finding GameManager's real callers, comparing `GetStatsAsyncNotification`
+byte-for-byte) rather than continuing PS3-side static/live disassembly of the reconnect-loop code
+— that path has now told us what it can (confirms a reconnect cycle exists and roughly how long it
+waits) without revealing what network-level piece is actually missing.
+
 **Update 2026-09-25: PARAM.SFO fix retested live — RULES OUT the BLUS31543/GameDataCheck theory
 entirely.** With the synthetic `PARAM.SFO` in place (RPCS3's game list now shows a second row,
 `FIFA 17 / BLUS31543 / HDD Game / 01.00 / 248.00 B`, confirming the PSF parses correctly), a fresh
