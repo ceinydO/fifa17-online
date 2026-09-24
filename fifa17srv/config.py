@@ -30,6 +30,37 @@ class Config:
     cert_sig_hash: str = "sha256"  # "sha1" may be needed for very old TLS stacks
     cert_send_chain: bool = True  # False sends only the leaf cert, not leaf+CA
     idle_timeout: float = 60.0
+    # Eksperyment diagnostyczny: podstawia w odpowiedziach unikalne nazwy hostow
+    # (canary-*.test), zeby po logu RPCS3 ("DnsHook: DNS query for ...") zobaczyc,
+    # ktore pola gra naprawde czyta. Domyslnie wylaczone.
+    canary_hosts: bool = False
+    # Test uporzadkowania mapy CONF: gdy True (i canary_hosts True), CONF w PreAuthResponse
+    # zawiera TYLKO jeden klucz (nucleusConnect). Mapa z jednym elementem jest posortowana przy
+    # kazdym komparatorze, wiec jesli klient wtedy znajdzie klucz, problemem byla kolejnosc.
+    canary_single_conf: bool = False
+    # Port lokalnej atrapy Nucleusa (HTTP). Adres bazowy dla gry ustawia patch pamieci (nucleusConnect).
+    nucleus_port: int = 8081
+    # Port atrapy telemetrii EA (rl.data.ea.com, pin-river.data.ea.com, ...), przekierowanych
+    # przez IP/Hosts switches RPCS3 na 127.0.0.1. FEThread probuje sie tam laczyc po HTTPS co
+    # ok. 60s; bez nasluchu na tym porcie polaczenie wisi ~1s w EINPROGRESS zanim dostanie
+    # ENOTCONN, w kolko. Nasluch tutaj po prostu przyjmuje i natychmiast zamyka polaczenie
+    # (RST przez SO_LINGER), zeby klient dostal szybka, czysta porazke.
+    telemetry_port: int = 443
+    # Bisekcja dekodowania PreAuthResponse po stronie klienta. Lista grup pol zlozonych, ktore maja byc wyslane,
+    # rozdzielona przecinkami: cids (lista liczb, typ 7), cids4 (ta sama lista jako typ 4 LIST), conf, qoss.
+    # Domyslnie cids4,conf,qoss: klient przyjmuje odpowiedz tylko wtedy, gdy CIDS jest lista typu 4 (cids4);
+    # typ 7 (cids) powodowal odrzucenie calej PreAuthResponse. Pusty napis = tylko pola proste.
+    preauth_groups: str = "cids4,conf,qoss"
+    # Bisekcja odpowiedzi na Authentication::login: ktore czesci LoginResponse wysylac. sess = struktura SESS
+    # (UserLoginInfo), pdtl = PersonaDetails wewnatrz SESS. Domyslnie wszystko (sess,pdtl); pusty napis = same flagi.
+    login_groups: str = "sess,pdtl"
+    # UserSessions::UserAuthenticated (0x7802/0x0008, ladunek UserSessionLoginInfo) po odpowiedzi na login.
+    # Hipoteza: dopiero to powiadomienie tworzy lokalnego uzytkownika w menedzerze uzytkownikow SDK.
+    send_user_authenticated: bool = True
+    # Wartosci czasow w PreAuth CONF (klient je stosuje, format: liczba i przyrostek s). Do eksperymentow z limitem
+    # czasu: gdy logout zmienia moment, wiadomo, ktory z nich go wywoluje.
+    conf_request_timeout: str = "20s"
+    conf_idle_timeout: str = "40s"
 
     @property
     def cert_dir_path(self) -> Path:
