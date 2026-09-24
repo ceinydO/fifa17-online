@@ -346,32 +346,40 @@ now parses `NLMP`/`NQOS` from the client's request and `build_ext_data_update()`
 `BPS` (lowest-latency key from `NLMP`) and `QDAT` (mirroring the client's own `DBPS`/`NATT`/
 `UBPS`) in the `UserSessionExtendedDataUpdate` notification. Unit-tested the encoder locally
 (round-trips through `tdf.decode`/`pretty` correctly, shape matches `UserSessionExtendedData.cs`
-+ `NetworkQosData.cs`) but **not yet tested live against the PS3 client** — next session should
-run `update_and_run.ps1`, reproduce the Cup Match freeze, and check whether the spinner clears.
++ `NetworkQosData.cs`). **Tested live: disproven.** The notification correctly grew from 24B to
+128B (confirming `BPS`/`QDAT` were actually sent, `BPS='ea-sjc'`, `QDAT` mirroring the client's
+own NATT=4/DBPS=0/UBPS=0), but the client's behavior was byte-for-byte identical to before: same
+silence immediately after `updateNetworkInfo #2`/msg_num=40, same raw-ping-only tail. Keep the
+BPS/QDAT fields (more correct regardless, matches the confirmed TDF shape) but this is not the
+gate either.
+
+Also ran `disasm_range.py` over `0x00C92300`-`0x00C92600`, confirming the GameManager
+`getCommandName()`-style dispatch is a big `cmpwi`/`beq` chain covering the full command set
+(`addAdminPlayer` through `setGameEntryCriteria` and beyond) with each branch loading a literal
+string pointer — this is purely a name-lookup table (probably for logging/asserts), not evidence
+of the RPC path being invoked. No new leads from this.
 
 **Next investigation ideas, in rough priority order:**
 
-1. **Test the BPS/QDAT fix above live.** If it doesn't help, add it to "Tried and disproven" and
-   move on.
-2. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
+1. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
    `0x00C92400`-`0x00C926C0ish` (its entry is somewhere before `0x00C92400`, likely right after
    the `cmpwi`/`beq` chain starts — hasn't been located precisely yet). Whatever calls this to
    build a display/log string for a *specific* command number would show us which command (if any)
    the client is actually working with when it decides to give up and show "RE-CONNECT" — this is
    more promising than guessing at r5 values that `find_requests.py` can't resolve here.
-3. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
+2. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
    receive *unprompted* (server-initiated) versus what it expects the client to send — check
    whether Impulsum14 has a server-side "auto-invite to game" or "session ready" notification that
    fires without a matching client request, since the client here never asks for one.
-4. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
+3. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
    cross-reference, the same method used to find the `Stats` component and `UserData` shape this
    session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work. Given it
    fires right after login and before persona lookup, it's plausibly session/entitlement setup
    that later steps depend on.
-5. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
+4. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
    the client got further than a network stall (it's rendering *something*, just wrong/empty),
    which might be a more tractable lead than the frozen spinner.
-6. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
+5. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
    encoder output line by line, rather than trusting the Python field-list source.
 
 ## Reverse-engineering toolchain
