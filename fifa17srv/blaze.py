@@ -66,6 +66,16 @@ UPDATE_NETWORK_INFO_COMMAND = 0x0014
 # NotifyUserAdded, ktory uzywa tego samego ksztaltu struktury pod tym samym tagiem singularnym.
 LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND = 0x0032
 
+# Blaze::Stats -- komponent 0x0007, potwierdzony na drucie (klient wysyla go zaraz po lookupUsersByPersonaNames,
+# gdy wchodzi w Cup Match/Seasons). Namiary na dokladny uklad komend i typow pochodza z Impulsum14
+# (github.com/Mk0M/Impulsum14, ten sam ekosystem SDK co nasz projekt), ktory ma pelna, dzialajaca implementacje
+# tego komponentu -- numeracja komend (getStatGroup=4, getKeyScopesMap=15, getStatsByGroupAsync=16) zgadza sie
+# z tym, co realnie przyszlo od klienta (0x04/0x0F/0x10), a pola GetStatsByGroupRequest (EID/NAME/PCTR/POFF/
+# PTYP/TIME/VID) pasuja do przechwyconego zadania.
+STATS_COMPONENT = 0x0007
+GET_STATS_BY_GROUP_ASYNC_COMMAND = 0x0010          # StatsComponentCommand.getStatsByGroupAsync = 16
+GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.GetStatsAsyncNotification = 50
+
 # DIAGNOSTYKA: nazwa i ksztalt pola-listy w odpowiedzi na lookupUsersByPersonaNames NIE sa potwierdzone
 # w EBOOT (zob. komentarz przy build_lookup_users_response). Sesja 9: przetestowano 4 kandydatow na tag
 # (USER/VALU/DATA/LIST) pojedynczo przez zmienna BLAZE_LOOKUP_TAG, wszystkie jako tdf.LIST -- zaden nie
@@ -268,6 +278,24 @@ def build_ext_data_update() -> bytes:
     data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
     payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
+
+
+def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
+    """Blaze::Stats::KeyScopedStatValues -- ladunek powiadomienia GetStatsAsyncNotification (0x0007/0x0032),
+    ksztalt potwierdzony w Impulsum14 (Blaze3SDK/Blaze/Stats/KeyScopedStatValues.cs + StatValues.cs).
+    Klient wysyla getStatsByGroupAsync (0x0007/0x0010) i dostaje na nie PUSTA odpowiedz Reply -- prawdziwe
+    dane (tu: pusta lista statystyk, bo nie mamy zadnych realnych danych sezonu) przychodza AS YNC jako ta
+    notyfikacja. LAST=1 sygnalizuje klientowi koniec strumienia (brak kolejnych paczek)."""
+    stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, []))]
+    fields = [
+        ("GRNM", tdf.STRING, group_name),
+        ("KEY ", tdf.STRING, ""),
+        ("LAST", tdf.VARINT, 1),
+        ("STS ", tdf.STRUCT, stat_values),
+        ("VID ", tdf.VARINT, view_id),
+    ]
+    payload = tdf.encode(fields)
+    return build_notification(STATS_COMPONENT, GET_STATS_ASYNC_NOTIFICATION, payload)
 
 
 def build_get_account_response(component: int, command: int, msg_num: int, identity) -> bytes:
@@ -562,6 +590,18 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
                              f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
+                elif component == STATS_COMPONENT and command == GET_STATS_BY_GROUP_ASYNC_COMMAND:
+                    group_name, view_id = "", 0
+                    for tag, t, v in fields:
+                        if tag == "NAME":
+                            group_name = v
+                        elif tag == "VID":
+                            view_id = v
+                    resp = build_reply(component, command, msg_num, b"")
+                    cap.note(f"-> odpowiadam pusto na Stats::getStatsByGroupAsync (msg_num={msg_num}), "
+                             f"grupa={group_name!r}")
+                    extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
+                                    build_stats_async_notification(group_name, view_id)))
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
