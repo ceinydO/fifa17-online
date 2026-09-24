@@ -538,7 +538,18 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
                               canary: bool = False) -> bytes:
     """fetchClientConfig: top-level pole CONF = mapa string->string.
-    Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze."""
+    Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze.
+
+    HIPOTEZA (sesja 5, 2026-09-24): dyzasembler EBOOT pokazal, ze klient przed uruchomieniem
+    watku "FIFA FE Second Initial Thread" (ten sam watek, ktory zapetla sie co ~10s i nigdy
+    nie pozwala przejsc dalej ekranu "PRESS START TO RE-CONNECT") sprawdza flage configu o
+    nazwie "NEW_THREAD_FOR_FE_INIT_STAGE3" (funkcja 0x005C2C1C -> 0x0143D0A0, ktora czyta
+    wartosc po nazwie z domyslna=1/wlaczone, gdy klucza nie ma w configu). Jesli flaga
+    wlaczona -> wchodzi w ta zawieszajaca sie sciezke; jesli wylaczona -> pomija ja calkowicie
+    i idzie inna, starsza sciezka inicjalizacji. Nie wiemy, z ktorego dokladnie CFID klient
+    czyta ten klucz, wiec dodajemy go do WSZYSTKICH odpowiedzi configu (dodatkowy nieznany
+    klucz w mapie string->string jest bezpieczny -- reszta kluczy po prostu jest ignorowana)."""
+    disable_fe_stage3_thread = [("NEW_THREAD_FOR_FE_INIT_STAGE3", "0")]
     if cfid == "IdentityParams":
         redirect = "http://canary-redirect.test/success" if canary else "http://127.0.0.1/success"
         items = [("display", "console2/welcome"), ("redirect_uri", redirect)]
@@ -557,6 +568,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
                  for k in ("nucleusConnect", "nucleusConnectTrusted", "nucleusPortal", "nucleusProxy")]
     else:
         items = []
+    items = items + disable_fe_stage3_thread
     payload = tdf.encode([("CONF", tdf.MAP, (tdf.STRING, tdf.STRING, items))])
     return build_reply(component, command, msg_num, payload)
 
