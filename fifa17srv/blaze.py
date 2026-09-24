@@ -26,7 +26,6 @@ odtwarza wzorzec `Fire2Frame::reply()` z grid-leak/blaze.
 """
 from __future__ import annotations
 
-import os
 import socket
 import ssl
 import time
@@ -67,23 +66,12 @@ UPDATE_NETWORK_INFO_COMMAND = 0x0014
 # NotifyUserAdded, ktory uzywa tego samego ksztaltu struktury pod tym samym tagiem singularnym.
 LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND = 0x0032
 
-# DIAGNOSTYKA: nazwa pola-listy w odpowiedzi na lookupUsersByPersonaNames NIE jest potwierdzona w
-# EBOOT (zob. komentarz przy build_lookup_users_response). Zamiast zgadywac na sztywno, tag jest
-# wybierany przez zmienna srodowiskowa BLAZE_LOOKUP_TAG -- pozwala to przetestowac warianty bez
-# edycji kodu miedzy kolejnymi uruchomieniami serwera. Przyklad (PowerShell):
-#     $env:BLAZE_LOOKUP_TAG = "VALU"
-#     python -m fifa17srv run
-# Dopuszczalne wartosci (kandydaci wytypowani z analizy EBOOT): USER, VALU, DATA, LIST.
-# Brak ustawienia -> domyslnie "USER" (dotychczasowa hipoteza).
+# DIAGNOSTYKA: nazwa i ksztalt pola-listy w odpowiedzi na lookupUsersByPersonaNames NIE sa potwierdzone
+# w EBOOT (zob. komentarz przy build_lookup_users_response). Sesja 9: przetestowano 4 kandydatow na tag
+# (USER/VALU/DATA/LIST) pojedynczo przez zmienna BLAZE_LOOKUP_TAG, wszystkie jako tdf.LIST -- zaden nie
+# dal widocznego postepu. Zamiast zgadywac po kolei, build_lookup_users_response wysyla teraz wszystkie
+# warianty naraz (TDF ignoruje nieznane tagi), wiec ta zmienna juz nic nie wybiera.
 _LOOKUP_TAG_CANDIDATES = ("USER", "VALU", "DATA", "LIST")
-_lookup_tag_raw = os.environ.get("BLAZE_LOOKUP_TAG", "USER").strip().upper()
-if _lookup_tag_raw not in _LOOKUP_TAG_CANDIDATES:
-    print(f"UWAGA: BLAZE_LOOKUP_TAG={_lookup_tag_raw!r} nieznany, uzywam domyslnego 'USER'. "
-          f"Znane warianty: {', '.join(_LOOKUP_TAG_CANDIDATES)}")
-    _lookup_tag_raw = "USER"
-LOOKUP_TAG = _lookup_tag_raw   # tag uzyty w build_lookup_users_response, wszystkie kandydaci maja dokladnie 4 znaki
-print(f"[blaze] lookupUsersByPersonaNames: aktywny tag odpowiedzi = {LOOKUP_TAG} "
-      f"(zmien przez $env:BLAZE_LOOKUP_TAG przed uruchomieniem)")
 
 PERSONA_NAMESPACE = "cem_ea_id"
 DEFAULT_LOCALE = 1701724754        # 'enBR' -- taka wartosc klient wyslal w LANG w PreAuth
@@ -184,12 +172,22 @@ def build_user_added(identity) -> bytes:
 
 def build_lookup_users_response(component: int, command: int, msg_num: int, identity) -> bytes:
     """Odpowiedz na UserSessions::lookupUsersByPersonaNames (typ zadania Blaze::LookupUsersByPersonaNamesRequest
-    potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa pola-listy NIE --
-    HIPOTEZA: tag konfigurowany przez BLAZE_LOOKUP_TAG (domyslnie "USER") jako lista UserIdentification (ten
-    sam ksztalt co w NotifyUserAdded). Klient pytal o persone z wlasnego LoginRequest (PLST zawiera nazwe
-    gracza), wiec odpowiadamy jego wlasna tozsamoscia."""
-    user_list = (tdf.STRUCT, [build_user_identification(identity)])
-    payload = tdf.encode([(LOOKUP_TAG, tdf.LIST, user_list)])
+    potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa i ksztalt
+    pola-listy NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko rejestrowala typ w tabeli
+    refleksji, nie budowala odpowiedzi. Sesja 9: sprawdzono 4 kandydatow na tag jako tdf.LIST (USER/VALU/
+    DATA/LIST) -- zaden nie dal widocznego postepu, ale nigdy nie sprobowano pojedynczego tdf.STRUCT (bez
+    listy) pod tagiem USER, dokladnie tak jak w DZIALAJACYM NotifyUserAdded (ten sam ksztalt struktury).
+
+    Zamiast zgadywac po kolei, wysylamy "strzelba": pojedynczy STRUCT pod USER (najbardziej prawdopodobny,
+    bo to dokladnie ksztalt z NotifyUserAdded) ORAZ te sama tozsamosc jako LIST pod pozostalymi kandydatami.
+    TDF ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna."""
+    identity_struct = build_user_identification(identity)
+    fields = [("USER", tdf.STRUCT, identity_struct)]
+    for tag in _LOOKUP_TAG_CANDIDATES:
+        if tag == "USER":
+            continue
+        fields.append((tag, tdf.LIST, (tdf.STRUCT, [identity_struct])))
+    payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
 
@@ -522,8 +520,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: tag {LOOKUP_TAG}] "
-                             f"(Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: USER struct + "
+                             f"VALU/DATA/LIST listy naraz] (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
