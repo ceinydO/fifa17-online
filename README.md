@@ -265,23 +265,59 @@ timeout it gives up and shows the generic "lost connection" UI rather than proce
 would call GameManager. This is different from "the server sent a malformed reply" — it looks more
 like "the client is waiting for something the server never sends at all."
 
+**Update 2026-09-24, EBOOT static analysis of GameManager (component `0x0004`, confirmed via
+Impulsum14's `GameManagerBase.json`):** `find_requests.py` (backward-scans for `li r5,imm` /
+`li r6,imm` right before each call to the request-send function `0x00CFAD54`) found **190 total
+call sites in the whole EBOOT, and NOT ONE of them has a resolvable r5 (component)** — this
+compiler doesn't load the component id via an immediate right before the call, for any component,
+so this heuristic can't be used to prove or disprove a specific component is called. It's still
+useful for r6 (command): clusters of known commands appear together (e.g. `0x01CA2E4C`-`0x01CA338C`
+contains commands `0x0004/0x000F/0x0010`, matching Stats' `getStatGroup/getKeyScopesMap/
+getStatsByGroupAsync` — the RPC stub functions for a component appear to be laid out contiguously
+in the binary), but no such cluster of GameManager-shaped command values (createGame=1, joinGame,
+etc., per Impulsum14) was found anywhere in the 190 call sites.
+
+Confirmed via `find_str_refs.py` that GameManager **is** compiled into the client: literal strings
+`createGame`, `joinGame`, `NotifyGameSetup`, `cancelMatchmaking`, `startMatchmaking`, etc. all
+exist in EBOOT (`0x01FA90B8` onward), and `0x00C92400`-`0x00C92600` is a `getCommandName()`-style
+switch (command number in r3 → name string) covering GameManager's full ~40-command RPC set. This
+proves the component's code exists and isn't dead-code-eliminated, but a name lookup table doesn't
+prove where (or whether) the client actually *calls* `createGame`/`joinGame` — that would require
+finding callers of this command-name function or tracing the actual RPC dispatch, neither done yet.
+
+**Tried and disproven:** changed `qos.py`'s `/qos/firetype` response from `2` to `0` (Open vs.
+Strict in typical EA/DirtySDK NAT-type numbering), on the theory that the client refuses to attempt
+P2P after concluding it has a bad NAT type. Confirmed the change **does** reach the client and
+changes its own computed `NATT` value in the next `updateNetworkInfo` (was `1`, became `4`) — so
+the QoS responses genuinely feed into the client's NAT-type math — but the Cup Match freeze was
+**unaffected**: same "Loading Seasons information..." hang, no GameManager traffic, connection
+otherwise unchanged. Don't retry this specific value swap; if NAT-type theories come up again,
+the fact that `NATT` shifted 1→4 for a firetype 2→0 change is worth using to reverse-engineer what
+the field actually encodes before guessing another value blindly.
+
 **Next investigation ideas (not yet tried), in rough priority order:**
 
-1. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
+1. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
+   `0x00C92400`-`0x00C926C0ish` (its entry is somewhere before `0x00C92400`, likely right after
+   the `cmpwi`/`beq` chain starts — hasn't been located precisely yet). Whatever calls this to
+   build a display/log string for a *specific* command number would show us which command (if any)
+   the client is actually working with when it decides to give up and show "RE-CONNECT" — this is
+   more promising than guessing at r5 values that `find_requests.py` can't resolve here.
+2. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
    receive *unprompted* (server-initiated) versus what it expects the client to send — check
    whether Impulsum14 has a server-side "auto-invite to game" or "session ready" notification that
    fires without a matching client request, since the client here never asks for one.
-2. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
+3. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
    cross-reference, the same method used to find the `Stats` component and `UserData` shape this
    session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work. Given it
    fires right after login and before persona lookup, it's plausibly session/entitlement setup
    that later steps depend on.
-3. Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
+4. Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
    `TYPE="room"` is a concrete lead.
-4. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
+5. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
    the client got further than a network stall (it's rendering *something*, just wrong/empty),
    which might be a more tractable lead than the frozen spinner.
-5. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
+6. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
    encoder output line by line, rather than trusting the Python field-list source.
 
 ## Reverse-engineering toolchain
