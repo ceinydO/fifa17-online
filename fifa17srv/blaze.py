@@ -74,6 +74,7 @@ LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND = 0x0032
 # PTYP/TIME/VID) pasuja do przechwyconego zadania.
 STATS_COMPONENT = 0x0007
 GET_STAT_GROUP_COMMAND = 0x0004                    # StatsComponentCommand.getStatGroup = 4
+GET_KEY_SCOPES_MAP_COMMAND = 0x000F                # StatsComponentCommand.getKeyScopesMap = 15
 GET_STATS_BY_GROUP_ASYNC_COMMAND = 0x0010          # StatsComponentCommand.getStatsByGroupAsync = 16
 GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.GetStatsAsyncNotification = 50
 
@@ -313,6 +314,17 @@ def build_stat_group_response(component: int, command: int, msg_num: int, group_
         ("NAME", tdf.STRING, group_name),
         ("STAT", tdf.LIST, (tdf.STRUCT, [])),
     ]
+    payload = tdf.encode(fields)
+    return build_reply(component, command, msg_num, payload)
+
+
+def build_key_scopes_response(component: int, command: int, msg_num: int) -> bytes:
+    """Blaze::Stats::KeyScopes -- odpowiedz na getKeyScopesMap (0x0007/0x000F), ksztalt potwierdzony
+    w Impulsum14 (Blaze3SDK/Blaze/Stats/KeyScopes.cs): pojedyncze pole KSIT, map<string, KeyScopeItem>.
+    Wczesniej ta komenda wpadala w ogolny fallback i dostawala calkiem pusta odpowiedz (bez nawet pola
+    KSIT) -- to trzecia komenda w tej samej serii getStatGroup/getKeyScopesMap/getStatsByGroupAsync,
+    ktora klient wysyla przy wejsciu w Cup Match/Seasons, wiec tez potrzebuje typowanej odpowiedzi."""
+    fields = [("KSIT", tdf.MAP, (tdf.STRING, tdf.STRUCT, []))]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -620,6 +632,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     resp = build_stat_group_response(component, command, msg_num, group_name)
                     cap.note(f"-> wysylam Stats::StatGroupResponse dla grupy={group_name!r} "
                              f"(Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                elif component == STATS_COMPONENT and command == GET_KEY_SCOPES_MAP_COMMAND:
+                    resp = build_key_scopes_response(component, command, msg_num)
+                    cap.note(f"-> wysylam Stats::KeyScopes (pusta mapa KSIT, Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_STATS_BY_GROUP_ASYNC_COMMAND:
                     group_name, view_id = last_stat_group, 0
                     for tag, t, v in fields:
