@@ -1,71 +1,284 @@
 # fifa17-friendlies
 
-An open-source **server emulator for FIFA 17 online friendlies** (PC), so two people can play a
-1v1 match over the internet after EA shut the official servers down.
+A from-scratch, MIT-licensed **server emulator for FIFA 17's EA Blaze online servers**, which EA
+shut down. The concrete target being tested is the **PS3 build of FIFA 17, run under the RPCS3
+emulator**, but nothing here is PS3-only by design (redirector/Blaze/QoS/Nucleus/telemetry are all
+generic Blaze SDK 15.1.x infrastructure).
 
-> **Status: protocol-discovery phase (v0.1).** This release gets the game talking to *your*
-> machine and records everything it says. It does **not** yet play a match. The server logic
-> comes after we have real captures. Nothing here has been run against FIFA 17 itself yet.
+Not affiliated with, endorsed by, or connected to Electronic Arts. This is a preservation /
+reverse-engineering project: **you need your own legitimate copy of FIFA 17**. This project does
+**not** bypass DRM, Denuvo, or ownership/game-copy verification, does **not** help obtain pirated
+game or firmware copies, and must not contain or distribute any EA files, assets, keys, or the
+game itself.
 
-Not affiliated with, endorsed by, or connected to Electronic Arts. You need your own legitimate
-copy of FIFA 17. This project does **not** bypass DRM or ownership checks and must not contain
-or distribute any EA files, assets or keys.
+> **Read this file before starting a new session on this project.** It is written to be the single
+> source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
+> session (human or Claude) does not have to re-derive it from scratch.
 
-## What is tested and what is not
+## Current status (as of 2026-09-24)
 
-Tested with the built-in self-test (`python -m fifa17srv selftest`, synthetic clients, no game):
+The full PS3 client login handshake **works end-to-end**: redirector → TLS → PreAuth → Ping →
+fetchClientConfig → fake Nucleus OAuth → Blaze login → account/session notifications → main Online
+menu is reachable and playable-looking (Continue → checkbox → OK gets you into the FIFA17 Online
+menu with PLAY SEASON / ONLINE FRIENDLIES / CURRENT SEASON / TROPHY ROOM / PLAY CUP MATCH tiles).
 
-- fake redirector answering `redirector/getServerInstance` over TLS,
-- capture probe for plaintext **and** TLS connections, including TLS 1.0 clients,
-- ClientHello analysis and a byte-level handshake trace (what we sent, what the client answered),
-- SHA-1 signed certificates, built by hand because newer `cryptography` releases refuse to,
-- graceful handling of clients that reject the certificate,
-- TDF encoder/decoder round trip and the capture analyzer.
+**Open problem, unresolved:** selecting **"Play Cup Match"** takes the client to a stadium loading
+screen that gets stuck forever on **"Loading Seasons information..."**. Selecting **"PLAY SEASON"**
+instead shows a **blank screen** (a different failure mode, not yet investigated). See
+"Current blocker" below for everything captured about this so far and the open theories.
 
-**Unverified until we see real traffic:** the exact redirector XML FIFA 17 wants, whether the
-game's TLS stack accepts our certificate, whether `secure=0` is honoured, the frame header
-format (Blaze/FIRE2) and everything about match creation. The TDF codec follows other Blaze
-games and may need corrections.
+## Architecture
+
+```
+FIFA17 (PS3, via RPCS3)
+   |
+   |--TLS--> redirector (fake, HTTPS) --------- winter15.gosredirector.ea.com, answers
+   |                                             POST /redirector/getServerInstance with our
+   |                                             blaze host:port
+   |
+   |--plaintext or TLS--> blaze (main game server, port 10051) -- PreAuth, Ping, fetchClientConfig,
+   |                                             Authentication, UserSessions, Stats, ... (see below)
+   |
+   |--TLS--> qos (fake, HTTP-over-TLS, port 17502) -- NAT type / firewall / connectivity probing
+   |
+   |--plaintext--> nucleus (fake, HTTP, port 8081) -- fake OAuth: GET /connect/auth always succeeds
+   |                                             with a 302 to a fixed FAKE_AUTH_CODE
+   |
+   \--TLS--> telemetry (fake, port 443) -- accepts rl.data.ea.com / pin-river.data.ea.com
+                                            connections and immediately closes them (204/RST),
+                                            just so the client doesn't hang retrying
+```
+
+All of this is driven by editing the PS3's hosts resolution (via `tools/install_redirector.ps1`,
+which patches RPCS3's Windows hosts file) so `winter15.gosredirector.ea.com` and the telemetry
+hostnames resolve to `127.0.0.1`.
+
+## Blaze/Fire2 wire protocol (confirmed, not guessed)
+
+### 16-byte frame header
+
+Reconstructed from `grid-leak/blaze` (an open-source Blaze server for Mirror's Edge Catalyst, same
+2016 Blaze SDK 15.1.x family — its advertised `SVER "Blaze 15.1.1.0.5"` is a near-exact match for
+FIFA17's `BSDK "15.1.1.0.0"` from its CINF), and verified byte-for-byte against real FIFA17 PS3
+captures:
+
+```
+offset  0-3   payload_size   u32 BE
+offset  4-5   metadata_size  u16 BE  (always 0 in our captures -- no metadata section)
+offset  6-7   component      u16 BE
+offset  8-9   command        u16 BE
+offset 10-12  msg_num        3 bytes BE (NOT 2 -- grows with each request in the same session)
+offset 13     msg_type << 5  (Message=0, Reply=1, Notification=2, ErrorReply=3, Ping=4, PingReply=5)
+offset 14     options        always 0 in our captures
+offset 15     reserved       always 0 in our captures
+```
+
+A Reply has the **exact same** component/command/msg_num as the request it answers; only
+`msg_type` changes to `Reply(1)`. A Notification is server-initiated (no matching request),
+`msg_type=Notification(2)`, and its own independent msg_num sequence.
+
+### TDF (Trusted Data Format) tag/value encoding
+
+- Tag = 4 ASCII chars, 6 bits each (`code = char - 0x20`), packed big-endian into **3 bytes**.
+  Implemented in `tdf.py`'s `encode_tag()` / equivalent decode.
+- Field on the wire = 3-byte tag + 1 type byte + type-specific value encoding.
+- Wire types (index = the byte written, in `tdf.py` order):
+  `VARINT=0, STRING=1, BLOB=2, STRUCT=3, LIST=4, MAP=5, UNION=6, INTLIST=7, OBJTYPE=8, OBJID=9, FLOAT=10, TIME=11`.
+  (Blaze TDF has no separate "bool" wire type — booleans are VARINT 0/1.)
+- STRUCT ends with a `0x00` terminator byte after its fields.
+- LIST = 1 byte subtype + varint count + that many encoded values.
+- MAP = 1 byte key-type + 1 byte value-type + varint count + that many (key,value) pairs — the
+  value type byte is written even when the map is empty (count=0), so an "empty map" reply still
+  needs the correct key/value type bytes, not just a zero count.
+
+Full codec: `fifa17srv/tdf.py`. `_enc_value()` / `encode_field()` / `encode()` are the ones that
+matter; read them directly rather than trusting this summary if something looks off on the wire.
+
+## What's implemented in `fifa17srv/blaze.py`, component by component
+
+Legend: **[CONFIRMED]** = shape taken directly from EBOOT reflection data or matches a real
+reference implementation 1:1. **[HYPOTHESIS]** = best guess from field names/types only, not
+verified against any known implementation. **[UNHANDLED]** = falls through to the generic
+empty-Reply fallback (`0` TDF fields) — this is very likely *wrong* for any command that isn't
+purely a fire-and-forget notification, but the client has tolerated it so far for everything below
+except possibly the current blocker.
+
+- **`0x0009` Util** (`UTIL_COMPONENT`)
+  - `0x0007` PreAuth **[CONFIRMED]** → `PreAuthResponse` (bisected field-by-field via
+    `config.preauth_groups`; client only accepts CIDS as a type-4 LIST, not type-7 INTLIST)
+  - `0x0002` Ping **[CONFIRMED]** → `PingResponse`
+  - `0x0001` fetchClientConfig **[CONFIRMED]** → empty-ish typed reply per `CFID`
+    (`OSDK_CORE`, `OSDK_CLIENT`, `OSDK_NUCLEUS`, `OSDK_WEBOFFER`, `OSDK_ABUSE_REPORTING`,
+    `IdentityParams`, `OSDK_TICKER`, `OSDK_ROSTER` all observed)
+  - `0x0004` (`LANG`, `LSID` = list of localization string ids, e.g.
+    `SDB_ORIGIN_ACCT_WELCOME_BACK_HEADER`) **[UNHANDLED]** — looks like a batched localized-string
+    fetch (welcome-back dialog, opt-in dialog copy). Client proceeds fine with an empty reply, so
+    it's probably just falling back to baked-in English strings.
+  - `0x0005` (`CMAC`, `SNAM`) **[UNHANDLED]** — unknown, sent once right after login with a MAC
+    address and empty `SNAM`.
+  - `0x0008` (`DSUI`, `MAC`, `UDID`) **[UNHANDLED]** — unknown, looks like device/session info.
+  - `0x000A` (`KEY`, `UID`) **[UNHANDLED]** — looks like "get user setting by key". Observed keys:
+    `FirstTimeFlag`, `AchievementCache`. Empty reply tolerated so far, but a real implementation
+    should probably return the value or a proper NOT_FOUND, not zero fields — candidate suspect if
+    Seasons-related state is fetched this way somewhere.
+  - `0x000B` (`DATA`, `KEY`, `UID`) **[UNHANDLED]** — "set user setting by key", mirrors `0x000A`.
+  - `0x000C` (no fields) **[UNHANDLED]** — unknown.
+
+- **`0x0001` Authentication** (`AUTH_COMPONENT`)
+  - `0x000A` login **[CONFIRMED]** → `LoginResponse` (bisected via `config.login_groups`)
+  - `0x001E` getAccount **[HYPOTHESIS]** → `GetAccountResponse` — 16-field shape read from EBOOT's
+    reflection table (function `0x00C75874`), but no code building a *real* response was found
+    near it, only reflection metadata, so the field values themselves are guessed.
+  - `0x0014` (`CPWD`, `CTRY`, `DOB`, `LANG`, `MAIL`, `OPT1`, `OPT3`, `PASS`, `PRNT`) **[UNHANDLED]**
+    — looks like account creation / parental-consent data, all empty strings in the observed
+    capture (opt-in dialog path). Client proceeds fine.
+  - `0x0020` (`BUID`, `EPSN`, `EPSZ`, `FLAG`, `GNLS` = list of game names e.g. `FIFA17PS3BoxContent`,
+    `FIFA17PS3`, `FIFA16PS3`, `FIFAWC14PS3`) **[UNHANDLED]** — looks like an entitlement/ownership
+    check across a family of related titles. Client proceeds fine with an empty reply.
+  - `0x00F2` (`CTRY`, `PTFM`) **[UNHANDLED]** — small country/platform check, sent a few times.
+
+- **`0x0007` Stats** (`STATS_COMPONENT`) — standard EA Blaze SDK component, not FIFA-specific.
+  Confirmed against `Mk0M/Impulsum14` (github.com/Mk0M/Impulsum14), an open-source Blaze backend
+  for FIFA 14 PC on an older Blaze 13 SDK but the *same* SDK family/TDF layout — used as the
+  "Rosetta stone" for tag names and command numbers that can't be derived from EBOOT alone.
+  - `0x0004` getStatGroup **[CONFIRMED shape]** → `StatGroupResponse` (`CNAM/DESC/ETYP/KSUM/META/
+    NAME/STAT`), real group name (`NAME`, e.g. `H2HSeasonalPlay`) echoed back, everything else
+    empty since we have no real stat definitions.
+  - `0x000F` getKeyScopesMap **[CONFIRMED shape]** → `KeyScopes { KSIT: map<string, KeyScopeItem> }`,
+    sent as an empty map. **Added 2026-09-24** — previously fell through to the fully-empty
+    fallback (not even a `KSIT` field), which is almost certainly wrong for a typed response.
+    Confirmed on the wire afterwards, but did **not** fix the Cup Match freeze.
+  - `0x0010` getStatsByGroupAsync **[CONFIRMED pattern]** → empty `Reply`, then a separate
+    `GetStatsAsyncNotification` (`0x0007`/`0x0032`, `msg_type=Notification`) carrying
+    `KeyScopedStatValues { GRNM, KEY, LAST, STS{AGGR,STAT}, VID }` with the real group name (tracked
+    server-side across the connection as `last_stat_group`, since this request's own `NAME` field
+    arrives empty) and empty stat lists. This two-step Reply-then-Notification pattern is how
+    Impulsum14's server implements this exact RPC (`NotifyGetStatsAsyncNotificationAsync`).
+
+- **`0x000F`** (component identity **not confirmed** — candidate: Association Lists, a stock Blaze
+  component in other SDK versions)
+  - `0x0002` (`FLAG`, `MGID`, `PIDX`, `PSIZ`, `SMSK`, `SORT`, `SRCE` objid, `STAT`, `TARG` objid,
+    `TYPE`) **[UNHANDLED]** — `TYPE` decodes as a packed 4-char string: `1919905645 = "room"`. Looks
+    like "get/list association list of type ROOM" (friends list, room list, or similar). Worth
+    identifying properly — this and `0x08C9` below are the two unexplained components seen in the
+    observed flow.
+  - `0x0005` (same struct shape, `FLAG=0`, no readable `TYPE`) **[UNHANDLED]**.
+
+- **`0x000A`** (component identity not confirmed) — `0x0001`, zero-field request, **[UNHANDLED]**.
+
+- **`0x0015`** (component identity not confirmed) — `0x000A` (`UPDT` varint), **[UNHANDLED]**.
+
+- **`0x08C9`** (component identity **not confirmed**, likely FIFA-specific since it's not in
+  Impulsum14/any generic Blaze SDK component list) — `0x0001` and `0x0002`, both zero-payload
+  requests, both **[UNHANDLED]**. Sent right after `getAccount` succeeds, *before* the persona
+  lookup. Not yet identified via EBOOT static analysis — good candidate to check next, since it's
+  FIFA-specific and untouched so far.
+
+- **`0x7802` UserSessions** (`USER_SESSIONS_COMPONENT`)
+  - `0x0032` lookupUsersByPersonaNames **[HYPOTHESIS]** → sends `ULST = LIST<UserData>` (tag name
+    `ULST` confirmed via Impulsum14's `UserDataResponse.cs`; the `UserData` struct shape
+    `EXBB/EXID/ID/NAME/NASP/FLGS` read directly from EBOOT reflection data next to
+    `UserIdentification`'s) as the priority field, **plus** a shotgun fallback of
+    `USER/VALU/DATA/LIST` tags with the older `UserIdentification` shape, in case the client
+    actually wants one of those instead. This response format is the least confidently verified
+    of the "working" pieces — it visibly works (client proceeds), but which of the two field sets
+    the client is actually reading was never isolated.
+  - `0x0014` updateNetworkInfo **[CONFIRMED pattern]** → empty `Reply` + `UserSessionExtendedDataUpdate`
+    notification (`0x0001`). Observed **twice** per connection: once right after login with
+    placeholder NAT info (`NATT=5`), once later after QoS probing on port 17502 with real results
+    (`NATT=1` in the last capture).
+  - Notifications, all **[CONFIRMED]** patterns (sent unprompted after login):
+    `UserAuthenticated` (`0x0008`), `NotifyUserAdded` (`0x0002`), `UserUpdated` (`0x0005`),
+    `UserSessionExtendedDataUpdate` (`0x0001`).
+
+## Current blocker: "Loading Seasons information..." freeze
+
+**Repro:** log in (Continue → tick checkbox → OK) → FIFA17 Online menu → **Play Cup Match** →
+stadium loading screen → stuck forever on "Loading Seasons information...". (**PLAY SEASON**
+instead shows a blank screen — a different, also-unfixed failure mode, not yet captured/analyzed
+separately.)
+
+**What the wire capture shows, most recent run (2026-09-24, after the `getKeyScopesMap` fix):**
+everything from login through the full Stats burst completes cleanly, in order, with correct data
+and no error/disconnect:
+
+1. `lookupUsersByPersonaNames` (`0x7802/0x0032`) → our UserData reply
+2. `Stats::getStatGroup` (`0x0007/0x0004`, `NAME='H2HSeasonalPlay'`) → `StatGroupResponse` with the
+   real group name echoed
+3. `Stats::getKeyScopesMap` (`0x0007/0x000F`) → `KeyScopes{KSIT: {}}`
+4. `Stats::getStatsByGroupAsync` (`0x0007/0x0010`) → empty `Reply` + `GetStatsAsyncNotification`
+   with the real group name, empty stat lists, `LAST=1`
+5. Two rounds of QoS HTTP probing on port 17502 (`/qos/qos`, `/qos/firewall`, `/qos/firetype`) —
+   all `200 OK`
+6. `UserSessions::updateNetworkInfo` (`0x7802/0x0014`) sent a **second** time by the client, now
+   with real NAT-detection results — answered with empty `Reply` + `UserSessionExtendedDataUpdate`
+   notification
+
+**After step 6, the client sends nothing further at all.** This is the key fact: it is not that a
+later request gets mishandled — the client goes completely silent while the loading spinner keeps
+spinning. That points to one of:
+
+- **(a)** the client waiting on some other async Notification we never send, from a component
+  whose role is still unidentified (`0x08C9` and `0x000F` above are the prime suspects, since
+  they're the only pieces of the observed flow that are still a complete black box);
+- **(b)** a client-side check against the *content* of one of our replies failing silently — e.g.
+  something subtly wrong in `GetStatsAsyncNotification`'s byte layout that isn't visible just from
+  the Python-level field list (Impulsum14 itself has never been observed on real FIFA17 wire
+  traffic for this exact packet, only cross-referenced structurally);
+- **(c)** the freeze has nothing to do with Stats at all, and is really about `0x08C9`/`0x000F`
+  getting empty fallback replies earlier in the flow.
+
+**Next investigation ideas (not yet tried):**
+
+- Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
+  cross-reference, the same method used to find the `Stats` component and `UserData` shape this
+  session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work.
+- Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
+  `TYPE="room"` is a concrete lead.
+- Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
+  the client got further than a network stall (it's rendering *something*, just wrong/empty),
+  which might be a more tractable lead than the frozen spinner.
+- Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
+  encoder output line by line, rather than trusting the Python field-list source.
+
+## Reverse-engineering toolchain
+
+The PS3 EBOOT.ELF static-analysis scripts (`find_str_refs.py`, `find_cmd_consts.py`,
+`find_cmd_names.py`, `find_requests.py`, `disasm_range.py`, `dump_words.py`,
+`find_tdf_members.py`, ...) used to derive the confirmed facts above **are not part of this git
+repository** — they live only on the Windows machine where the actual RE work happens, alongside
+the (not-redistributed) EBOOT.ELF itself. If starting a fresh session without that context, ask
+the user to run the relevant tool and paste its output rather than assuming the tools are
+available locally; each tool prints its own usage/docstring on `--help` or bad args, which is more
+reliable than remembering exact flags from a previous session.
+
+Reference implementation used for cross-checking tag names / command numbers / TDF field layouts:
+`github.com/Mk0M/Impulsum14` — an open-source, from-scratch C# Blaze backend for **FIFA 14 PC**
+(older Blaze 13 SDK, same TDF/SDK family). Treat it as a strong hint for *shape*, not as ground
+truth for FIFA 17 specifically — SDK versions drift, and nothing in it has ever been confirmed
+against real FIFA 17 wire traffic.
 
 ## Quick start (Windows 10/11)
 
 1. Install Python 3.11+ and this folder somewhere convenient.
-2. Open **PowerShell as Administrator** in the project folder:
+2. Open **PowerShell as Administrator** in the project folder (one-time setup):
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\tools\install_redirector.ps1
    ```
    (adds one hosts line and creates `certs/`; it does *not* touch your certificate store)
-3. Run the tests (optional but recommended): `python -m fifa17srv selftest`
-4. Start the server: `python -m fifa17srv run`
-5. Start FIFA 17 and go to an online mode (e.g. Online Friendlies).
-6. Look in `logs/captures/`. Zip that folder and share it (it contains only what the game sent
-   to *your* machine, but glance through it first).
-7. When done, undo the changes:
+3. Every time you want to test: `powershell -ExecutionPolicy Bypass -File .\update_and_run.ps1`
+   (pulls the latest server code and starts it in one step — see below).
+4. Start FIFA 17 (via RPCS3) and go to an online mode.
+5. Look in `logs/captures/` and paste the server's console log back for analysis.
+6. When permanently done, undo the redirector changes:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\tools\remove_redirector.ps1
    ```
 
-## Reading the results
-
-| What you see in `logs/captures/redirector_*.txt` | Meaning / next step |
-|---|---|
-| `TLS handshake OK` and an HTTP request | The game trusts our cert. Continue with the Blaze capture. |
-| `TLS handshake FAILED ... unknown ca` / `bad certificate` | The game rejected the cert. Try `install_redirector.ps1 -InstallCA`, or `python -m fifa17srv certs --sha1`. If that fails, the game has its own CA list and we need a different approach (see below). |
-| `HINT: the client dropped the connection right after our ServerHelloDone` | The game got our certificate and hung up without a word: it does not trust it (or cannot parse it). Try `certs --force --sha1`, then `-InstallCA`. If nothing helps, the game most likely validates against a CA list inside its executable. |
-| `TLS handshake FAILED ... version/cipher` | Read the ClientHello lines: they list what the game offers (probably SSLv3/TLS1.0 with legacy ciphers modern OpenSSL dropped). |
-| Nothing at all | Hosts entry not active, wrong port, or a firewall. Check `ping winter15.gosredirector.ea.com` resolves to 127.0.0.1. |
-
-After a good redirector step you should also get `blaze_*.txt` and `blaze_*_c2s.bin`. Inspect the
-binary with:
-
-```
-python -m fifa17srv analyze logs/captures/blaze_XXXX_c2s.bin
-```
-
-It hexdumps the data, lists strings and guesses the frame-header size by finding the offset from
-which the payload decodes cleanly as TDF.
-
-If the game refuses a plaintext main connection, retry with `python -m fifa17srv run --secure 1`.
+`update_and_run.ps1` (repo root) just does `git pull origin claude/new-session-ab3wdx` followed by
+`python -m fifa17srv run`, run from the repo root via `$PSScriptRoot`. It exists because
+`logs/`, `certs/`, and `config.json` are all gitignored, so there is never anything local worth
+preserving — no need for `git add`/`commit`/`push` before pulling.
 
 ## Playing with a friend (later)
 
@@ -75,7 +288,9 @@ your friend put that address in *their* hosts file for `winter15.gosredirector.e
 
 ## Configuration
 
-Create `config.json` next to this file to override any field of `fifa17srv/config.py`, e.g.
+Create `config.json` next to this file to override any field of `fifa17srv/config.py` (the
+dataclass there is the source of truth — read it directly, it's short and every field has a
+comment explaining what it's for and why it exists), e.g.
 
 ```json
 { "bind_address": "0.0.0.0", "blaze_advertise_host": "26.1.2.3", "blaze_secure": false }
@@ -85,13 +300,16 @@ Create `config.json` next to this file to override any field of `fifa17srv/confi
 
 ```
 fifa17srv/redirector.py   fake redirector (HTTPS)
+fifa17srv/blaze.py        main Blaze protocol handler -- almost all protocol logic lives here
 fifa17srv/probe.py        capture probe for the main Blaze port
 fifa17srv/server.py       threaded server, capture logs, TLS-or-plaintext negotiation
 fifa17srv/tls_hello.py    ClientHello parser (explains handshake failures)
-fifa17srv/tdf.py          TDF codec (best effort, see caveats)
+fifa17srv/tdf.py          TDF codec
 fifa17srv/analyze.py      capture inspection helper
 fifa17srv/certs.py        throwaway local CA + server cert
+fifa17srv/config.py       Config dataclass, all tunables with inline comments
 tools/*.ps1               hosts/CA install and removal (Windows, run as admin)
+update_and_run.ps1        one-command pull + run for repeat testing
 ```
 
 ## Security notes
@@ -103,11 +321,13 @@ tools/*.ps1               hosts/CA install and removal (Windows, run as admin)
 
 ## Roadmap
 
-1. Capture redirector + first Blaze packets (this release).
-2. Confirm frame format; implement PreAuth / Ping / Authentication responses.
-3. Get the client to a logged-in main menu with a local fake profile.
-4. Online friendlies: lobby, invite, matchmaking, session hand-off (P2P vs relayed to be determined).
-5. Docs of the protocol (clean-room notes, no EA code).
+1. ~~Capture redirector + first Blaze packets.~~ Done.
+2. ~~Confirm frame format; implement PreAuth / Ping / Authentication responses.~~ Done.
+3. ~~Get the client to a logged-in main menu with a local fake profile.~~ Done.
+4. **Current:** get past the Online menu into an actual match (Cup Match freeze / Season blank
+   screen — see "Current blocker" above).
+5. Online friendlies: lobby, invite, matchmaking, session hand-off (P2P vs relayed TBD).
+6. Docs of the protocol (clean-room notes, no EA code).
 
 ## Related work
 
