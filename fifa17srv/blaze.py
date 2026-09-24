@@ -170,19 +170,57 @@ def build_user_added(identity) -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
+def build_user_data(identity):
+    """Blaze::UserManager::UserData -- INNY typ niz UserIdentification. Znaleziony sesja 9 poprzez
+    find_tdf_members.py przeszukujac tabele refleksji pod katem pol UserIdentification: zaraz PO tej
+    tabeli w EBOOT (0x0254DD4C-0x0254DE04) siedzi OSOBNA tabela pol z dokladnie 6 tagami w tej kolejnosci:
+    EXBB (externalBlob), EXID (externalId), ID (blazeId), NAME (name), NASP (personaNamespace),
+    FLGS (statusFlags) -- FLGS potwierdzone liczbowo (enc('FLGS')<<8 == 0x9AC9F300, dokladnie ta wartosc
+    w danych). To mniejszy ksztalt niz UserIdentification (brak AID/ALOC/ORIG/PIDI) i jest silnym
+    kandydatem na prawdziwy typ elementu listy w odpowiedzi lookupUsersByPersonaNames -- w przeciwienstwie
+    do UserIdentification (uzywany tylko w NotifyUserAdded), tej tabeli nigdy nie probowalismy wyslac."""
+    name, ext_id, blob = identity
+    return [
+        ("EXBB", tdf.BLOB, blob),
+        ("EXID", tdf.VARINT, ext_id),
+        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("NAME", tdf.STRING, name),
+        ("NASP", tdf.STRING, PERSONA_NAMESPACE),
+        ("FLGS", tdf.VARINT, USER_FLAG_ONLINE),
+    ]
+
+
 def build_lookup_users_response(component: int, command: int, msg_num: int, identity) -> bytes:
     """Odpowiedz na UserSessions::lookupUsersByPersonaNames (typ zadania Blaze::LookupUsersByPersonaNamesRequest
     potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa i ksztalt
-    pola-listy NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko rejestrowala typ w tabeli
-    refleksji, nie budowala odpowiedzi. Sesja 9: sprawdzono 4 kandydatow na tag jako tdf.LIST (USER/VALU/
-    DATA/LIST) -- zaden nie dal widocznego postepu, ale nigdy nie sprobowano pojedynczego tdf.STRUCT (bez
-    listy) pod tagiem USER, dokladnie tak jak w DZIALAJACYM NotifyUserAdded (ten sam ksztalt struktury).
+    pola-listy przez dlugi czas NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko
+    rejestrowala typ w tabeli refleksji, nie budowala odpowiedzi.
 
-    Zamiast zgadywac po kolei, wysylamy "strzelba": pojedynczy STRUCT pod USER (najbardziej prawdopodobny,
-    bo to dokladnie ksztalt z NotifyUserAdded) ORAZ te sama tozsamosc jako LIST pod pozostalymi kandydatami.
-    TDF ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna."""
+    Sesja 9 cz.1: sprawdzono 4 kandydatow na tag jako tdf.LIST z UserIdentification (USER/VALU/DATA/LIST)
+    oraz USER jako pojedynczy STRUCT -- zaden nie dal widocznego postepu.
+
+    Sesja 9 cz.2: sledzenie miejsca wywolania RPC (find_requests.py -> disasm_range.py) doprowadzilo do
+    nowo alokowanego obiektu-odpowiedzi, ktorego deskryptor klasy w danych ELF (find_tdf_members.py z
+    tagami UserIdentification) ujawnil DRUGA, ODDZIELNA tabele pol zaraz obok: Blaze::UserManager::UserData
+    (EXBB/EXID/ID/NAME/NASP/FLGS, patrz build_user_data) -- inny typ niz UserIdentification, nigdy dotad
+    nie wyslany.
+
+    Sesja 9 cz.3: reczny przeglad open-source projektu Impulsum14 (github.com/Mk0M/Impulsum14 --
+    backend FIFA 14 PC, ten sam rodzaj SDK -- EATDF/ProtoFire/Blaze.Core, tylko starsza wersja
+    Blaze 13 zamiast naszej 15.1.x) pokazal PELNA, dzialajaca definicje Blaze::UserDataResponse:
+    pole-lista NIE nazywa sie USER (ani VALU/DATA/LIST) -- nazywa sie ULST ("UserDataList",
+    tag 0xD6CCF400), co potwierdza rowniez policzony enc('ULST')<<8. To bylo do znalezienia w kodzie
+    innej gry z tego samego ekosystemu, a nie do wygrzebania w disasemblerze -- ten tag ma NAJWYZSZY
+    priorytet, bo pochodzi z dzialajacego, potwierdzonego kodu serwera Blaze innej gry EA z tej samej
+    rodziny SDK, nie z domyslu.
+
+    Wysylamy ULST jako LIST<UserData> (najwyzszy priorytet -- potwierdzona nazwa pola z Impulsum14 +
+    potwierdzony w EBOOT ksztalt struktury) razem z poprzednimi wariantami pod USER/VALU/DATA/LIST (TDF
+    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna)."""
     identity_struct = build_user_identification(identity)
-    fields = [("USER", tdf.STRUCT, identity_struct)]
+    user_data_struct = build_user_data(identity)
+    fields = [("ULST", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
+    fields.append(("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct])))
     for tag in _LOOKUP_TAG_CANDIDATES:
         if tag == "USER":
             continue
@@ -520,8 +558,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: USER struct + "
-                             f"VALU/DATA/LIST listy naraz] (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: ULST=LIST<UserData> "
+                             f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
+                             f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
