@@ -19,7 +19,6 @@ TYPE_NAMES = ["varint", "string", "blob", "struct", "list", "map", "union",
               "intlist", "objtype", "objid", "float", "time"]
 UNION_UNSET = 0x7F
 
-# A decoded field: (tag, type_id, value)
 Field = Tuple[str, int, Any]
 
 
@@ -27,39 +26,24 @@ class TdfError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- tags
 def encode_tag(tag: str) -> bytes:
+    """4 chars x 6 bits, each 6-bit code = ASCII - 0x20 (space=0, 'A'=33 ... '_'=63).
+    Verified against a real FIFA 17 capture (e.g. b"\\x8e\\x48\\x74" == "CDAT")."""
     tag = tag.upper().ljust(4)[:4]
     value = 0
     for i, ch in enumerate(tag):
         c = ord(ch)
-        if ch == " ":
-            s = 0
-        elif 0x40 < c <= 0x5F:
-            s = c - 0x40
-        elif 0x20 < c < 0x40:
-            s = c
-        else:
+        if not (0x20 <= c <= 0x5F):
             raise TdfError(f"cannot encode tag character {ch!r}")
-        value |= s << (18 - 6 * i)
+        value |= (c - 0x20) << (18 - 6 * i)
     return value.to_bytes(3, "big")
 
 
 def decode_tag(raw: bytes) -> str:
     v = int.from_bytes(raw, "big")
-    chars = []
-    for i in range(4):
-        s = (v >> (18 - 6 * i)) & 0x3F
-        if s == 0:
-            chars.append(" ")
-        elif s < 0x20:
-            chars.append(chr(0x40 + s))
-        else:
-            chars.append(chr(s))
-    return "".join(chars).rstrip()
+    return "".join(chr(((v >> (18 - 6 * i)) & 0x3F) + 0x20) for i in range(4)).rstrip()
 
 
-# ---------------------------------------------------------------- reader
 class Reader:
     def __init__(self, data: bytes, pos: int = 0):
         self.d, self.p = data, pos
@@ -166,7 +150,6 @@ def _read_struct(r: Reader, depth: int) -> List[Field]:
 
 
 def decode_partial(data: bytes, pos: int = 0) -> Tuple[List[Field], int, Optional[str]]:
-    """Decode consecutive top-level fields from pos. Returns (fields, offset_reached, error)."""
     r = Reader(data, pos)
     out: List[Field] = []
     err = None
@@ -188,7 +171,6 @@ def decode(data: bytes) -> List[Field]:
     return fields
 
 
-# ---------------------------------------------------------------- writer
 def enc_varint(v: int) -> bytes:
     if v < 0:
         v &= (1 << 64) - 1
@@ -242,7 +224,6 @@ def encode(fields: List[Field]) -> bytes:
     return b"".join(encode_field(*f) for f in fields)
 
 
-# ---------------------------------------------------------------- pretty printing
 def pretty(fields: List[Field], indent: int = 0) -> str:
     pad = "  " * indent
     lines = []

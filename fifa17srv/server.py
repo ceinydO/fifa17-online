@@ -32,17 +32,20 @@ class Capture:
         self.bin_path = f"{self.base}_c2s.bin"
 
     def note(self, msg: str) -> None:
+        # NOTE: no flush() here on purpose. Flushing on every single log line forces a
+        # synchronous disk write per Blaze frame, which can stall for tens of seconds if the
+        # disk is busy with something else (e.g. a huge RPCS3.log growing during a debugging
+        # session), and that stall blocks this connection's thread badly enough that the game
+        # times out and thinks it lost connection to EA. Python still flushes the OS-level
+        # buffer periodically and on close(), so nothing is lost, just not written instantly.
         self._txt.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        self._txt.flush()
         log.info("[%s] %s", self.tag, msg.replace("\n", " | "))
 
     def data(self, direction: str, chunk: bytes) -> None:
         self.note(f"{direction} {len(chunk)} bytes")
         self._txt.write(hexdump(chunk) + "\n")
-        self._txt.flush()
         if direction == "C->S":
             self._bin.write(chunk)
-            self._bin.flush()
 
     def close(self) -> None:
         for f in (self._txt, self._bin):
