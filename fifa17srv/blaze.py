@@ -35,6 +35,8 @@ from .config import Config
 from .qos import QOS_PORT
 from .server import Capture, negotiate
 
+_LOOPBACK_IP_U32 = int.from_bytes(socket.inet_aton("127.0.0.1"), "big")  # 2130706433
+
 UTIL_COMPONENT = 0x0009
 PRE_AUTH_COMMAND = 0x0007
 PING_COMMAND = 0x0002
@@ -275,11 +277,28 @@ def build_user_updated() -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_UPDATED, payload)
 
 
-def build_ext_data_update() -> bytes:
-    """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001)."""
-    data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
+def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0) -> bytes:
+    """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001).
+
+    HIPOTEZA (2026-09-24): wczesniej ADDR bylo UNSET -- klient sam prosi o swoj adres w
+    updateNetworkInfo, ale nigdy nie dostawal odpowiedzi z prawdziwym adresem z powrotem.
+    Teraz wysylamy ADDR jako IpPairAddress (disc=2, tag VALU, ksztalt EXIP/INIP potwierdzony
+    na drucie w zadaniu klienta updateNetworkInfo) z EXIP=INIP=to co klient sam podal jako
+    swoj adres lokalny (jestesmy wszyscy na loopback, wiec 'zewnetrzny' adres = ten sam)."""
+    if ip == 0:
+        ip = _LOOPBACK_IP_U32
+    ip_addr = [("IP  ", tdf.VARINT, ip), ("MACI", tdf.VARINT, maci), ("PORT", tdf.VARINT, port)]
+    ip_pair = [("EXIP", tdf.STRUCT, ip_addr), ("INIP", tdf.STRUCT, ip_addr), ("MACI", tdf.VARINT, maci)]
+    data = [("ADDR", tdf.UNION, (2, ("VALU", tdf.STRUCT, ip_pair)))]
     payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
+
+
+def _find_field(fields, tag):
+    for t, _typ, v in fields:
+        if t == tag:
+            return v
+    return None
 
 
 def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
@@ -615,7 +634,16 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif component == USER_SESSIONS_COMPONENT and command == UPDATE_NETWORK_INFO_COMMAND:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> odpowiadam pusto na UserSessions::updateNetworkInfo (msg_num={msg_num})")
-                    extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]", build_ext_data_update()))
+                    info_v = _find_field(fields, "INFO") or []
+                    addr_v = _find_field(info_v, "ADDR")
+                    maci = port = 0
+                    if addr_v and addr_v[1] is not None:
+                        _, _, valu_v = addr_v[1]
+                        inip_v = _find_field(valu_v, "INIP") or []
+                        port = _find_field(inip_v, "PORT") or 0
+                        maci = _find_field(valu_v, "MACI") or 0
+                    extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]",
+                                    build_ext_data_update(maci=maci, port=port)))
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)
