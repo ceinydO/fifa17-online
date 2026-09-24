@@ -170,19 +170,47 @@ def build_user_added(identity) -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
+def build_user_data(identity):
+    """Blaze::UserManager::UserData -- INNY typ niz UserIdentification. Znaleziony sesja 9 poprzez
+    find_tdf_members.py przeszukujac tabele refleksji pod katem pol UserIdentification: zaraz PO tej
+    tabeli w EBOOT (0x0254DD4C-0x0254DE04) siedzi OSOBNA tabela pol z dokladnie 6 tagami w tej kolejnosci:
+    EXBB (externalBlob), EXID (externalId), ID (blazeId), NAME (name), NASP (personaNamespace),
+    FLGS (statusFlags) -- FLGS potwierdzone liczbowo (enc('FLGS')<<8 == 0x9AC9F300, dokladnie ta wartosc
+    w danych). To mniejszy ksztalt niz UserIdentification (brak AID/ALOC/ORIG/PIDI) i jest silnym
+    kandydatem na prawdziwy typ elementu listy w odpowiedzi lookupUsersByPersonaNames -- w przeciwienstwie
+    do UserIdentification (uzywany tylko w NotifyUserAdded), tej tabeli nigdy nie probowalismy wyslac."""
+    name, ext_id, blob = identity
+    return [
+        ("EXBB", tdf.BLOB, blob),
+        ("EXID", tdf.VARINT, ext_id),
+        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("NAME", tdf.STRING, name),
+        ("NASP", tdf.STRING, PERSONA_NAMESPACE),
+        ("FLGS", tdf.VARINT, USER_FLAG_ONLINE),
+    ]
+
+
 def build_lookup_users_response(component: int, command: int, msg_num: int, identity) -> bytes:
     """Odpowiedz na UserSessions::lookupUsersByPersonaNames (typ zadania Blaze::LookupUsersByPersonaNamesRequest
     potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa i ksztalt
-    pola-listy NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko rejestrowala typ w tabeli
-    refleksji, nie budowala odpowiedzi. Sesja 9: sprawdzono 4 kandydatow na tag jako tdf.LIST (USER/VALU/
-    DATA/LIST) -- zaden nie dal widocznego postepu, ale nigdy nie sprobowano pojedynczego tdf.STRUCT (bez
-    listy) pod tagiem USER, dokladnie tak jak w DZIALAJACYM NotifyUserAdded (ten sam ksztalt struktury).
+    pola-listy przez dlugi czas NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko
+    rejestrowala typ w tabeli refleksji, nie budowala odpowiedzi.
 
-    Zamiast zgadywac po kolei, wysylamy "strzelba": pojedynczy STRUCT pod USER (najbardziej prawdopodobny,
-    bo to dokladnie ksztalt z NotifyUserAdded) ORAZ te sama tozsamosc jako LIST pod pozostalymi kandydatami.
-    TDF ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna."""
+    Sesja 9 cz.1: sprawdzono 4 kandydatow na tag jako tdf.LIST z UserIdentification (USER/VALU/DATA/LIST)
+    oraz USER jako pojedynczy STRUCT -- zaden nie dal widocznego postepu.
+
+    Sesja 9 cz.2: sledzenie miejsca wywolania RPC (find_requests.py -> disasm_range.py) doprowadzilo do
+    nowo alokowanego obiektu-odpowiedzi, ktorego deskryptor klasy w danych ELF (find_tdf_members.py z
+    tagami UserIdentification) ujawnil DRUGA, ODDZIELNA tabele pol zaraz obok: Blaze::UserManager::UserData
+    (EXBB/EXID/ID/NAME/NASP/FLGS, patrz build_user_data) -- inny typ niz UserIdentification, nigdy dotad
+    nie wyslany. To najsilniejszy dotychczasowy kandydat, bo pochodzi z faktycznej tabeli refleksji obok
+    kodu obslugujacego ta konkretna odpowiedz, a nie z domysłu po nazwie.
+
+    Wysylamy USER jako LIST<UserData> (nowa hipoteza, priorytet) razem z poprzednimi wariantami (TDF
+    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna)."""
     identity_struct = build_user_identification(identity)
-    fields = [("USER", tdf.STRUCT, identity_struct)]
+    user_data_struct = build_user_data(identity)
+    fields = [("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
     for tag in _LOOKUP_TAG_CANDIDATES:
         if tag == "USER":
             continue
@@ -520,8 +548,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: USER struct + "
-                             f"VALU/DATA/LIST listy naraz] (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: USER=LIST<UserData> "
+                             f"(EXBB/EXID/ID/NAME/NASP/FLGS, z tabeli refleksji EBOOT) + VALU/DATA/LIST "
+                             f"listy UserIdentification naraz] (Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
