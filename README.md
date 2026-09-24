@@ -351,9 +351,9 @@ if a command against one of these fails, since setups can change):
 - RE tool scripts: `C:\fifa17-friendlies-git\fifa17srv\` (run scripts from here, e.g.
   `python find_requests.py ...`)
 - EBOOT.ELF: `C:\fifa17-ps3\EBOOT.ELF`
-- RPCS3 install root: `C:\rpcs3` -- its native/HLE log file has not yet been located precisely;
-  next session should ask the user for `Get-ChildItem C:\rpcs3 -Recurse -Filter *.log` output and
-  record the exact log path here once found.
+- RPCS3 install root: `C:\rcps3` (note the transposed letters, that's the real path). Native/HLE
+  log: `C:\rcps3\log\RPCS3.log` (several MB, grep it rather than pasting whole). TTY log (game's
+  own stdout/stderr, much smaller): `C:\rcps3\log\TTY.log`.
 
 Reference implementation used for cross-checking tag names / command numbers / TDF field layouts:
 `github.com/Mk0M/Impulsum14` — an open-source, from-scratch C# Blaze backend for **FIFA 14 PC**
