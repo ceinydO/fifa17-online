@@ -277,19 +277,32 @@ def build_user_updated() -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_UPDATED, payload)
 
 
-def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0) -> bytes:
+def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0, best_ping_site: str = "",
+                           dbps: int = 0, ubps: int = 0, natt: int = 0) -> bytes:
     """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001).
 
     HIPOTEZA (2026-09-24): wczesniej ADDR bylo UNSET -- klient sam prosi o swoj adres w
     updateNetworkInfo, ale nigdy nie dostawal odpowiedzi z prawdziwym adresem z powrotem.
     Teraz wysylamy ADDR jako IpPairAddress (disc=2, tag VALU, ksztalt EXIP/INIP potwierdzony
     na drucie w zadaniu klienta updateNetworkInfo) z EXIP=INIP=to co klient sam podal jako
-    swoj adres lokalny (jestesmy wszyscy na loopback, wiec 'zewnetrzny' adres = ten sam)."""
+    swoj adres lokalny (jestesmy wszyscy na loopback, wiec 'zewnetrzny' adres = ten sam).
+
+    HIPOTEZA (sesja 4, 2026-09-24): klient w drugim updateNetworkInfo przysyla NLMP (sam
+    zmierzone opoznienie do ping site'ow, np. 'ea-sjc') i NQOS (DBPS/NATT/UBPS, sam wyliczone).
+    UserSessionExtendedData (potwierdzone w Impulsum14) ma pola BPS (BestPingSiteAlias) i QDAT
+    (Util::NetworkQosData {DBPS,NATT,UBPS}), ktorych NIGDY nie wypelnialismy (tylko ADDR).
+    Ekran "laczenie" w grach EA Sports typowo czeka na potwierdzenie od serwera, ktory ping
+    site jest najlepszy (BPS) i jakie jest ostateczne QOS/NAT, zanim zniknie spinner -- wiec
+    odsylamy z powrotem to, co klient sam zmierzyl/wyliczyl, zamiast milczec na te pola."""
     if ip == 0:
         ip = _LOOPBACK_IP_U32
     ip_addr = [("IP  ", tdf.VARINT, ip), ("MACI", tdf.VARINT, maci), ("PORT", tdf.VARINT, port)]
     ip_pair = [("EXIP", tdf.STRUCT, ip_addr), ("INIP", tdf.STRUCT, ip_addr), ("MACI", tdf.VARINT, maci)]
     data = [("ADDR", tdf.UNION, (2, ("VALU", tdf.STRUCT, ip_pair)))]
+    if best_ping_site:
+        data.append(("BPS ", tdf.STRING, best_ping_site))
+    qos_data = [("DBPS", tdf.VARINT, dbps), ("NATT", tdf.VARINT, natt), ("UBPS", tdf.VARINT, ubps)]
+    data.append(("QDAT", tdf.STRUCT, qos_data))
     payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
 
@@ -642,8 +655,19 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         inip_v = _find_field(valu_v, "INIP") or []
                         port = _find_field(inip_v, "PORT") or 0
                         maci = _find_field(valu_v, "MACI") or 0
+                    best_ping_site = ""
+                    nlmp_v = _find_field(info_v, "NLMP")
+                    if nlmp_v is not None:
+                        _, _, items = nlmp_v
+                        if items:
+                            best_ping_site = min(items, key=lambda kv: kv[1])[0]
+                    nqos_v = _find_field(info_v, "NQOS") or []
+                    dbps = _find_field(nqos_v, "DBPS") or 0
+                    ubps = _find_field(nqos_v, "UBPS") or 0
+                    natt = _find_field(nqos_v, "NATT") or 0
                     extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]",
-                                    build_ext_data_update(maci=maci, port=port)))
+                                    build_ext_data_update(maci=maci, port=port, best_ping_site=best_ping_site,
+                                                           dbps=dbps, ubps=ubps, natt=natt)))
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)

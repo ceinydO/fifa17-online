@@ -310,25 +310,64 @@ address was not the (sole) gate either. Keep this fix (it's more correct than `U
 and future components may depend on it), but stop looking at `UserSessionExtendedData`'s `ADDR`
 field as the blocker.
 
-**Next investigation ideas (not yet tried), in rough priority order:**
+**Update 2026-09-24, third data point + component IDs resolved, BPS/QDAT fix tried:** user
+clarified the "freeze" is actually a **persistent spinning loading icon in the corner of the
+screen**, not a hard hang — raw frame-level pings keep succeeding indefinitely, confirming the
+client is alive and just idling/waiting, not crashed. Checked the RPCS3 native log (`sceNp*`
+calls) around and after the freeze point: **no `sceNpMatching2`/signaling calls at all** — only
+trophies, the known/unrelated `sceNpCommerce2` store-check failures, and a periodic
+`sceNpBasicSetPresence` heartbeat. This rules out "client is stuck waiting on native PSN
+matchmaking" as a cause — the blocker is confirmed to be Blaze-level, not RPCS3/PSN-level.
 
-1. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
+Resolved two previously-unidentified component IDs against Impulsum14
+(`Components/*ComponentBase.json`, cross-checked against `PostLoginComponents.cs`, a working
+reference server's post-login handler set):
+- `0x000A` (10 decimal) = **CensusData** (`SubscribeToCensusDataAsync`) — our empty-Reply fallback
+  is *correct* (Impulsum14's reference handler also just returns `EmptyMessage`).
+- `0x000F` (15 decimal) = **Messaging** (`fetchMessages`=2, `getMessages`=5, confirmed by command
+  numbers matching exactly) — NOT "Rooms" as previously guessed (that guess conflated hex/decimal).
+  Empty-Reply fallback is correct here too (reference handler returns `EmptyMessage`).
+- `0x0015` (21 decimal) = **Rooms** (`selectViewUpdates`=10, matches the observed `UPDT=1` field
+  from `SelectViewUpdatesRequest.cs`) — empty-Reply fallback is *also correct*
+  (`RoomsComponent.SelectViewUpdatesAsync` in the reference returns `EmptyMessage` too).
+  So the earlier "`TYPE=room`" lead on component `0x000F` was based on a hex/decimal mixup and
+  is a dead end; Rooms subscription itself needs no reply body.
+
+None of these three were the blocker. But comparing our `updateNetworkInfo` handling against
+`UserSessionExtendedData`'s full field list (`Address.cs` set: `ADDR`/`BPS`/`CMAP`/`CTY`/`CVAR`/
+`DMAP`/`HWFG`/`PSLM`/`QDAT`/`UATT`/`ULST`) turned up a real gap: the client's second
+`updateNetworkInfo` sends us `NLMP` (its own measured ping-site latencies, e.g. `'ea-sjc':
+1601961990`) and `NQOS` (`DBPS`/`NATT`/`UBPS`, self-computed), but our
+`UserSessionExtendedDataUpdate` notification only ever echoed `ADDR` — never `BPS`
+(`BestPingSiteAlias`) or `QDAT` (`Util::NetworkQosData`). EA Sports' "connecting" spinner is
+plausibly waiting on the server to confirm the best ping site / finalize QoS before it can
+dismiss. **Tried (2026-09-24, not yet verified live):** `blaze.py`'s `updateNetworkInfo` handler
+now parses `NLMP`/`NQOS` from the client's request and `build_ext_data_update()` echoes back
+`BPS` (lowest-latency key from `NLMP`) and `QDAT` (mirroring the client's own `DBPS`/`NATT`/
+`UBPS`) in the `UserSessionExtendedDataUpdate` notification. Unit-tested the encoder locally
+(round-trips through `tdf.decode`/`pretty` correctly, shape matches `UserSessionExtendedData.cs`
++ `NetworkQosData.cs`) but **not yet tested live against the PS3 client** — next session should
+run `update_and_run.ps1`, reproduce the Cup Match freeze, and check whether the spinner clears.
+
+**Next investigation ideas, in rough priority order:**
+
+1. **Test the BPS/QDAT fix above live.** If it doesn't help, add it to "Tried and disproven" and
+   move on.
+2. Find the actual **caller(s)** of the GameManager `getCommandName()` function at
    `0x00C92400`-`0x00C926C0ish` (its entry is somewhere before `0x00C92400`, likely right after
    the `cmpwi`/`beq` chain starts — hasn't been located precisely yet). Whatever calls this to
    build a display/log string for a *specific* command number would show us which command (if any)
    the client is actually working with when it decides to give up and show "RE-CONNECT" — this is
    more promising than guessing at r5 values that `find_requests.py` can't resolve here.
-2. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
+3. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
    receive *unprompted* (server-initiated) versus what it expects the client to send — check
    whether Impulsum14 has a server-side "auto-invite to game" or "session ready" notification that
    fires without a matching client request, since the client here never asks for one.
-3. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
+4. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
    cross-reference, the same method used to find the `Stats` component and `UserData` shape this
    session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work. Given it
    fires right after login and before persona lookup, it's plausibly session/entitlement setup
    that later steps depend on.
-4. Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
-   `TYPE="room"` is a concrete lead.
 5. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
    the client got further than a network stall (it's rendering *something*, just wrong/empty),
    which might be a more tractable lead than the frozen spinner.
