@@ -228,18 +228,61 @@ spinning. That points to one of:
 - **(c)** the freeze has nothing to do with Stats at all, and is really about `0x08C9`/`0x000F`
   getting empty fallback replies earlier in the flow.
 
-**Next investigation ideas (not yet tried):**
+**Update 2026-09-24, second data point:** captured the "Play Cup Match" path again (same server
+run, `getKeyScopesMap` fix in place). The Blaze wire trace is byte-for-byte identical in shape to
+the first capture above. New information this time came from two places that aren't Blaze traffic
+at all:
 
-- Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
-  cross-reference, the same method used to find the `Stats` component and `UserData` shape this
-  session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work.
-- Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
-  `TYPE="room"` is a concrete lead.
-- Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
-  the client got further than a network stall (it's rendering *something*, just wrong/empty),
-  which might be a more tractable lead than the frozen spinner.
-- Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
-  encoder output line by line, rather than trusting the Python field-list source.
+- **The stadium loading screen shows a banner: "⊗ PRESS THE START BUTTON TO RE-CONNECT"** (red
+  no-globe icon, top right). This is the first concrete UI-level signal we've gotten — the client
+  itself believes it has lost its online connection, it's not just a spinner with nothing behind
+  it.
+- **The raw Blaze TCP connection is provably still alive and healthy** the whole time: frame-level
+  pings (`component=0x0000 command=0x0000 msg_type=4`, i.e. `Ping`/`PingReply` at the transport
+  level, distinct from `Util::ping`) keep arriving every ~20s and get answered normally, for over
+  a minute after the client goes silent at the application level. So this is **not** a dropped
+  socket or a raw timeout — whatever decides to show "RE-CONNECT" is a higher-level client-side
+  check.
+- **`GameManager` (the standard Blaze component for creating/joining a game session, `0x0004` in
+  most SDK versions) never appears anywhere in any capture we have**, including this one. Every
+  other component in the observed flow up to this point (Util `0x0009`, Auth `0x0001`, Stats
+  `0x0007`, UserSessions `0x7802`, the two unidentified `0x000F`/`0x08C9`) has shown up at least
+  once. If Cup Match needs to create or join a game session, the client should eventually send
+  *something* to a GameManager-shaped component — it never does, which means whatever it's
+  waiting on happens **before** it would even attempt that.
+- The RPCS3 native log around the same time shows the client's PSN layer doing an unrelated
+  `sceNpCommerce2` store/DLC product-info check (`GetProductInfoListStart`, 26 product IDs) that
+  fails with `SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT` — this is PS3's real Store API, not Blaze,
+  and RPCS3 marks its handler `TODO` (unimplemented stub). Almost certainly unrelated to the
+  freeze (a real PS3 would talk to Sony's actual store for this), but noted here in case it turns
+  out not to be.
+
+**Working theory, unconfirmed:** the "RE-CONNECT" banner is most likely the client's own
+watchdog/precondition check for entering online play — something it expects to have (a piece of
+`UserSessionExtendedDataUpdate` state, a Notification from a component we haven't identified, or
+a QoS/NAT result it doesn't like) never arrives or never satisfies it, so after some internal
+timeout it gives up and shows the generic "lost connection" UI rather than proceeding to whatever
+would call GameManager. This is different from "the server sent a malformed reply" — it looks more
+like "the client is waiting for something the server never sends at all."
+
+**Next investigation ideas (not yet tried), in rough priority order:**
+
+1. Identify the real `GameManager`-equivalent component in this SDK/build and what it expects to
+   receive *unprompted* (server-initiated) versus what it expects the client to send — check
+   whether Impulsum14 has a server-side "auto-invite to game" or "session ready" notification that
+   fires without a matching client request, since the client here never asks for one.
+2. Identify component `0x08C9` (2249 decimal) in EBOOT via static analysis (string/reflection-table
+   cross-reference, the same method used to find the `Stats` component and `UserData` shape this
+   session). It's FIFA-specific so it won't be in Impulsum14 — needs direct EBOOT work. Given it
+   fires right after login and before persona lookup, it's plausibly session/entitlement setup
+   that later steps depend on.
+3. Identify component `0x000F`'s real command shapes properly instead of guessing from field names;
+   `TYPE="room"` is a concrete lead.
+4. Capture and analyze the **PLAY SEASON → blank screen** path separately — a blank screen implies
+   the client got further than a network stall (it's rendering *something*, just wrong/empty),
+   which might be a more tractable lead than the frozen spinner.
+5. Hex-dump-verify `GetStatsAsyncNotification`'s actual bytes on the wire against `tdf.py`'s
+   encoder output line by line, rather than trusting the Python field-list source.
 
 ## Reverse-engineering toolchain
 
