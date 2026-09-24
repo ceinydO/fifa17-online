@@ -1,40 +1,60 @@
 """Stub for EA telemetry hosts (rl.data.ea.com, pin-river.data.ea.com, ...).
 
 These hostnames get redirected to 127.0.0.1 via RPCS3's IP/Hosts switches (DNS Swap List),
-and the game tries to reach them over HTTPS on port 443. We don't implement the actual
-telemetry protocol -- we just want the connection to fail *fast* and *cleanly* instead of
-sitting around waiting for a timeout that never resolves cleanly on Windows (observed as
-sys_net_bnet_connect -> EINPROGRESS, then ~1s later sys_net_bnet_shutdown -> ENOTCONN,
-repeating roughly every 60 seconds from FEThread).
+and the game tries to reach them over HTTPS on port 443.
 
-Accepting the TCP connection and closing it immediately gives the client an immediate
-RST/FIN instead of a half-open socket, which should let it notice failure sooner and stop
-retrying in a way that could be blocking UI progress.
+Wersja 1 (WYKLUCZONA -- patrz HANDOFF sesja 9, Tor 2): accept+close natychmiast, bez
+odczytania czegokolwiek. To dawalo klientowi RST/FIN zamiast polowicznie otwartego socketu,
+ale najwyrazniej gra ROBI cos wiecej z ta polaczeniem niz tylko heartbeat -- prawdopodobnie
+SeasonalPlayDownloader czeka na udana transakcje HTTP (200 OK) zanim odpyta komponent Stats.
+
+Wersja 2 (ta): robimy prawdziwy handshake TLS (jak qos.py) i odpowiadamy realnym
+"HTTP/1.1 200 OK" z pustym cialem, zamiast zrywac polaczenie od razu. Jesli to byl
+rzeczywiscie blocker, po tej zmianie w Cup Match powinno pojawic sie NOWE zadanie Blaze
+(np. do komponentu Stats) zamiast tylko keepalive pingow.
 """
 from __future__ import annotations
 
 import logging
-import os
 import socket
-import struct
+
+from .config import Config
+from .server import Capture, negotiate
 
 log = logging.getLogger("fifa17srv")
 
-# struct linger differs by platform: Windows (winsock) uses two u_short (4 bytes total),
-# POSIX typically uses two int (8 bytes total). Pack the right one so SO_LINGER actually
-# takes effect instead of silently failing/raising.
-_LINGER_ON_ZERO = struct.pack("hh", 1, 0) if os.name == "nt" else struct.pack("ii", 1, 0)
 
-
-def handle(conn: socket.socket, addr) -> None:
-    log.info("[telemetry] connection from %s, closing immediately (stub, no real telemetry)", addr)
+def handle(conn: socket.socket, addr, cfg: Config, ctx=None) -> None:
+    cap = Capture(cfg, "telemetry", addr)
     try:
-        # Reject rather than silently hang: SO_LINGER(on=1, timeout=0) makes close() send an
-        # immediate RST instead of a graceful FIN, so the client notices failure right away.
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _LINGER_ON_ZERO)
-    except OSError:
-        pass
-    try:
-        conn.close()
-    except OSError:
-        pass
+        stream = conn
+        if ctx is not None:
+            stream = negotiate(conn, ctx, cap)
+            if stream is None:
+                return
+        stream.settimeout(5)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                chunk = stream.recv(4096)
+                if not chunk:
+                    break
+                cap.data("C->S", chunk)
+                buf += chunk
+        except OSError as exc:
+            cap.note(f"telemetry: blad przy odczycie zadania: {exc}")
+        if buf:
+            line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            cap.note(f"telemetry zadanie: {line}")
+        else:
+            cap.note("telemetry: klient nawiazal polaczenie ale nie przyslal zadania HTTP")
+        resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        try:
+            stream.sendall(resp)
+            cap.note("telemetry odpowiedz: 200 OK, 0B")
+        except OSError as exc:
+            cap.note(f"telemetry: nie udalo sie wyslac odpowiedzi: {exc}")
+    except OSError as exc:
+        cap.note(f"blad polaczenia telemetry: {exc}")
+    finally:
+        cap.close()

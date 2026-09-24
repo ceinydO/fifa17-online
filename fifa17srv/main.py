@@ -55,10 +55,11 @@ def cmd_run(args) -> int:
     nsrv = Server("nucleus", cfg.bind_address, cfg.nucleus_port,
                   lambda c, a: nucleus.handle(c, a, cfg)).start()
     # DODANE: atrapa telemetrii EA (rl.data.ea.com / pin-river.data.ea.com -> 127.0.0.1 przez
-    # IP/Hosts switches RPCS3). Bez tego nasluchu polaczenia FEThread na port 443 wisza
-    # ~1s w EINPROGRESS zanim dostana ENOTCONN, w kolko co ok. 60s.
+    # IP/Hosts switches RPCS3). Sesja 9 / Tor 2: zamiast accept+close teraz robimy prawdziwy
+    # handshake TLS i odpowiadamy HTTP 200 OK -- testujemy hipoteze, ze SeasonalPlayDownloader
+    # czeka na udana transakcje telemetrii zanim odpyta Stats (patrz docs/HANDOFF.md).
     tsrv = Server("telemetry", cfg.bind_address, cfg.telemetry_port,
-                  lambda c, a: telemetry_stub.handle(c, a)).start()
+                  lambda c, a: telemetry_stub.handle(c, a, cfg, ctx)).start()
     print(BANNER.format(ver=__version__, bind=cfg.bind_address, rport=rsrv.port, host=cfg.redirector_host,
                         bport=psrv.port, adv=cfg.blaze_advertise_host, secure=cfg.blaze_secure,
                         qport=qsrv.port, nport=nsrv.port, tport=tsrv.port, logs=cfg.log_dir_path))
