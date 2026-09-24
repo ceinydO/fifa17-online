@@ -203,14 +203,24 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, iden
     nowo alokowanego obiektu-odpowiedzi, ktorego deskryptor klasy w danych ELF (find_tdf_members.py z
     tagami UserIdentification) ujawnil DRUGA, ODDZIELNA tabele pol zaraz obok: Blaze::UserManager::UserData
     (EXBB/EXID/ID/NAME/NASP/FLGS, patrz build_user_data) -- inny typ niz UserIdentification, nigdy dotad
-    nie wyslany. To najsilniejszy dotychczasowy kandydat, bo pochodzi z faktycznej tabeli refleksji obok
-    kodu obslugujacego ta konkretna odpowiedz, a nie z domysłu po nazwie.
+    nie wyslany.
 
-    Wysylamy USER jako LIST<UserData> (nowa hipoteza, priorytet) razem z poprzednimi wariantami (TDF
+    Sesja 9 cz.3: reczny przeglad open-source projektu Impulsum14 (github.com/Mk0M/Impulsum14 --
+    backend FIFA 14 PC, ten sam rodzaj SDK -- EATDF/ProtoFire/Blaze.Core, tylko starsza wersja
+    Blaze 13 zamiast naszej 15.1.x) pokazal PELNA, dzialajaca definicje Blaze::UserDataResponse:
+    pole-lista NIE nazywa sie USER (ani VALU/DATA/LIST) -- nazywa sie ULST ("UserDataList",
+    tag 0xD6CCF400), co potwierdza rowniez policzony enc('ULST')<<8. To bylo do znalezienia w kodzie
+    innej gry z tego samego ekosystemu, a nie do wygrzebania w disasemblerze -- ten tag ma NAJWYZSZY
+    priorytet, bo pochodzi z dzialajacego, potwierdzonego kodu serwera Blaze innej gry EA z tej samej
+    rodziny SDK, nie z domyslu.
+
+    Wysylamy ULST jako LIST<UserData> (najwyzszy priorytet -- potwierdzona nazwa pola z Impulsum14 +
+    potwierdzony w EBOOT ksztalt struktury) razem z poprzednimi wariantami pod USER/VALU/DATA/LIST (TDF
     ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna)."""
     identity_struct = build_user_identification(identity)
     user_data_struct = build_user_data(identity)
-    fields = [("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
+    fields = [("ULST", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
+    fields.append(("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct])))
     for tag in _LOOKUP_TAG_CANDIDATES:
         if tag == "USER":
             continue
@@ -548,9 +558,9 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: USER=LIST<UserData> "
-                             f"(EXBB/EXID/ID/NAME/NASP/FLGS, z tabeli refleksji EBOOT) + VALU/DATA/LIST "
-                             f"listy UserIdentification naraz] (Reply, msg_num={msg_num}), "
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: ULST=LIST<UserData> "
+                             f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
+                             f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
