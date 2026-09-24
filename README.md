@@ -647,6 +647,96 @@ Reference implementation used for cross-checking tag names / command numbers / T
 truth for FIFA 17 specifically — SDK versions drift, and nothing in it has ever been confirmed
 against real FIFA 17 wire traffic.
 
+### Ghidra setup (started 2026-09-25, pivot away from ad-hoc byte-scanning scripts)
+
+**Why:** the hand-rolled Python byte-scanning scripts above (`find_callers.py`, raw `li`/`ori`
+immediate scans, `cmpwi`/`beq` chain heuristics for "dispatch tables") produced **two confirmed
+false positives in a single session** — a `cmpwi`/`beq` chain at `0x00C92380`-`0x00C92420` that
+looked exactly like a command-dispatch switch was actually a generic ASCII character
+classifier/string parser unrelated to GameManager or any Blaze component. Static analysis without
+real cross-references (xrefs) is too unreliable for finding "who calls this" — every "next step"
+in the Current Blocker section above that says "find the real caller of X" needs a proper
+disassembler with xrefs, not more grep.
+
+**Already installed** on the user's machine: Ghidra 12.1.3 PUBLIC at
+`C:\fifa17-ps3\ghidra\ghidra_12.1.3_PUBLIC` (Java: Eclipse Adoptium JDK 21 at
+`C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot`, already working, no need to reinstall).
+
+**Import gotcha, already solved — do not redo this investigation:** the user's *first* import
+attempt (a file plainly named `EBOOT.ELF` inside the Ghidra project) was done **without picking a
+Language**, so the whole file sat as undefined `??` bytes with 0 functions found — completely
+useless. The fix was a **second, correct import**, named `v2_EBOOT.ELF` to avoid clashing with the
+broken one, explicitly selecting language **`PowerPC:BE:64:default:default`** (64-bit big-endian
+PowerPC w/ Altivec — matches the PS3 Cell PPU). **If starting fresh or re-importing, always
+explicitly set this language — do not let the importer leave it blank.** The broken plain
+`EBOOT.ELF` entry is still sitting in the project and should probably be deleted at some point, but
+hasn't caused any problems being left there.
+
+**Ghidra project location:**
+- Project directory: `C:\fifa17-ps3\ghidra_projects`
+- Project name: `FIFA17` (so the `.gpr`/`.rep` are `C:\fifa17-ps3\ghidra_projects\FIFA17.gpr` etc.)
+- The correctly-imported program inside it: `v2_EBOOT.ELF` (at project root `/`)
+- File stats from the import summary: **40,732,646 bytes** (~40.7 MB), 34 memory blocks, 72,997
+  defined data items, 0 functions (not yet analyzed at import time — see below).
+
+**Auto-analysis: kicked off headless, running overnight, status unknown as of this README update.**
+GUI-based analysis was abandoned as unpredictable/unable-to-show-real-progress for a binary this
+size (this bit the project on a previous, separate Ghidra attempt described by the user as
+"mieliło" for an indeterminate time with no way to tell if it would ever finish). Instead, used
+Ghidra's **headless analyzer**, which is more reliable for large unattended runs. Two gotchas hit
+and fixed while setting this up, worth knowing before running it again:
+1. `-analysisTimeoutPerFile 0` does **NOT** mean "unlimited" — it is taken literally as a 0-second
+   timeout, so analysis aborts instantly (`"Analysis timed out at 0 seconds"`). Use a large explicit
+   value instead, e.g. `86400` (24 hours).
+2. The project must **not** be open in the Ghidra GUI at the same time (file lock) — close the GUI
+   entirely (File → Exit Ghidra) before running headless against the same project.
+
+The exact command used (run from `C:\fifa17-ps3\ghidra\ghidra_12.1.3_PUBLIC\support`, in a
+PowerShell session with `$env:MAXMEM = "24G"` set beforehand — user has 32GB RAM, left 8GB for the
+OS):
+```powershell
+cd C:\fifa17-ps3\ghidra\ghidra_12.1.3_PUBLIC\support
+$env:MAXMEM = "24G"
+.\analyzeHeadless.bat "C:\fifa17-ps3\ghidra_projects" FIFA17 -process v2_EBOOT.ELF -analysisTimeoutPerFile 86400
+```
+Confirmed this actually started real analysis (log showed `ANALYZING all memory and code:
+/v2_EBOOT.ELF` followed by a couple of harmless `ERROR Invalid GIF data at ...` lines from the
+Embedded Media analyzer misfiring on some non-GIF data — not a real problem, analysis continues
+past those). Left running unattended overnight in a PowerShell window the user was told not to
+close. **Next session must first check whether this finished successfully** (console should show
+a final `INFO  REPORT: Save succeeded for processed file: /v2_EBOOT.ELF` with no accompanying
+timeout error) before doing anything else — if it's still running, either wait for it or (if it
+looks stuck/crashed) re-launch the same command, which should resume/redo cleanly since headless
+re-processing an already-partially-analyzed file is safe.
+
+**Once analysis is confirmed complete, the concrete next steps are** (do these instead of any more
+manual byte-scanning):
+1. Open the project in the Ghidra GUI (double-click `v2_EBOOT.ELF` in the `FIFA17` project — this
+   time it should show real disassembly and decompiled pseudo-C, not `??`).
+2. Find the confirmed Blaze request-send function `0x00CFAD54` and use Ghidra's **"Find References
+   to"** (right-click the function, or place cursor on its entry and check the XREF panel) to get
+   the complete, real list of callers — filter for any that set up `component=0x0004` (GameManager)
+   before calling it, since GameManager traffic has never been observed on the wire in any capture
+   this project has taken.
+3. Search Program Strings (Search → For Strings) for `createGame`, `joinGame`, `NotifyGameSetup`,
+   `startMatchmaking` (already confirmed present in the binary via `find_str_refs.py` in an earlier
+   session, at `0x01FA90B8` onward) and use each string's XREF panel to find what actually
+   references them — this replaces the abandoned "find `getCommandName` dispatch caller" static
+   heuristic that gave a false positive.
+4. Re-investigate component `0x08C9` (2249 decimal): the only concrete lead so far is a real `li r4,
+   0x8C9` at VA `0x002991E0` feeding into a binary-search-over-sorted-array call at `0x01A148A0`
+   (confirmed generic `lower_bound`-style helper, not the Blaze send function) — with Ghidra's
+   decompiler on that surrounding function (starts around `0x00299180`), read the actual pseudo-C
+   to see what the binary-search result (a found "component descriptor" struct pointer) is used
+   for; earlier manual tracing suggested a field at `+4` might be a name-string pointer but this
+   needs the decompiler/live debugger to actually resolve the runtime pointer value, not more
+   static guessing.
+5. Once real xrefs are available, revisit whether the `0xA46528`/`0xA465D8` functions found via the
+   RPCS3 live debugger this session (a generic-looking "check status==2, notify, clear dirty flag"
+   pattern, and a list-iterating watchdog calling it) are actually part of Blaze's client-side
+   reconnect state machine, now that they can be traced properly instead of guessed from a single
+   live-debugger snapshot.
+
 ## Quick start (Windows 10/11)
 
 1. Install Python 3.11+ and this folder somewhere convenient.
