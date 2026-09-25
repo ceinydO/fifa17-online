@@ -709,10 +709,43 @@ timeout error) before doing anything else — if it's still running, either wait
 looks stuck/crashed) re-launch the same command, which should resume/redo cleanly since headless
 re-processing an already-partially-analyzed file is safe.
 
+**UPDATE 2026-09-25 evening — the `v2_EBOOT.ELF` headless run above used the WRONG language and
+should be considered abandoned/superseded.** After ~20h of the headless run showing essentially no
+progress signal (only two harmless GIF errors in the log the entire time, though CPU usage
+confirmed it was genuinely computing the whole time, ~100% of one core, never stuck/deadlocked), a
+community source (a PS3 reverse-engineering video, project name "Ratchet-RE") was found showing
+that PS3 EBOOT.ELF files should use language **`PowerPC:BE:64:A2ALT-32addr`** (shown in Ghidra's
+language picker as "PowerISA-Altivec-64-32addr", 32-bit addressing, big endian) — **not**
+`PowerPC:BE:64:default:default` which was used for `v2_EBOOT.ELF`. This matches a known open Ghidra
+bug (NationalSecurityAgency/ghidra#570): generic PPC64 language specs don't correctly process
+TOC/OPD/GOT for ELFs using PPC64 with 32-bit addressing, which is exactly the PS3 Cell PPU ABI.
+
+Killed the 20h-in `v2_EBOOT.ELF` headless process (`Stop-Process -Id <pid> -Force`) and re-imported
+the same `EBOOT.ELF` as a **new** program named `v3_EBOOT.ELF` in the same `FIFA17` project, this
+time explicitly picking language `PowerPC:BE:64:A2ALT-32addr`. Ran analysis **from the GUI this
+time** (not headless) with `Decompiler Switch Analysis` and `Decompiler Parameter ID` both
+unchecked in the Analysis Options dialog (both are known slow analyzers for large binaries per
+community reports). Result: **analysis completed in ~28 minutes** (started 21:57, done by ~22:25),
+found **53,160 functions** and **145,671 defined data items**. The decompiler window confirmed
+real, sane pseudo-C output (e.g. `.opd.FUN_00010200` calling `FUN_00027f90()` and `FUN_00028000()`),
+unlike the old profile which likely would have produced garbage/oversized functions from
+misinterpreted 64-bit-addressing pointers (plausible explanation for why the old run was so slow:
+Ghidra's decompiler has a known bug — NationalSecurityAgency/ghidra#4558 — where it can stall for
+hours on a single malformed/oversized function).
+
+**Conclusion for future sessions: use `v3_EBOOT.ELF` (language `PowerPC:BE:64:A2ALT-32addr`) as the
+canonical analyzed program going forward, not `v2_EBOOT.ELF`.** The `v2_EBOOT.ELF` program (wrong
+language) and the original blank `EBOOT.ELF` (no language) can both be considered dead ends, kept
+in the project only for reference/comparison, not for further investigation. If Ghidra analysis
+ever needs to be redone from scratch on this binary, always pick `PowerPC:BE:64:A2ALT-32addr`
+explicitly, and prefer GUI analysis with Decompiler Switch Analysis/Decompiler Parameter ID
+disabled over headless — it's fast enough now (minutes, not hours) that headless's unattended
+overnight approach is no longer necessary.
+
 **Once analysis is confirmed complete, the concrete next steps are** (do these instead of any more
-manual byte-scanning):
-1. Open the project in the Ghidra GUI (double-click `v2_EBOOT.ELF` in the `FIFA17` project — this
-   time it should show real disassembly and decompiled pseudo-C, not `??`).
+manual byte-scanning, and do them against `v3_EBOOT.ELF`, not `v2_EBOOT.ELF`):
+1. Open the project in the Ghidra GUI (double-click `v3_EBOOT.ELF` in the `FIFA17` project — this
+   should show real disassembly and decompiled pseudo-C).
 2. Find the confirmed Blaze request-send function `0x00CFAD54` and use Ghidra's **"Find References
    to"** (right-click the function, or place cursor on its entry and check the XREF panel) to get
    the complete, real list of callers — filter for any that set up `component=0x0004` (GameManager)
