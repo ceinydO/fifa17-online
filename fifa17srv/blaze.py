@@ -87,6 +87,21 @@ GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.
 # warianty naraz (TDF ignoruje nieznane tagi), wiec ta zmienna juz nic nie wybiera.
 _LOOKUP_TAG_CANDIDATES = ("USER", "VALU", "DATA", "LIST")
 
+# Komponent 0x08C9 (2249) -- nazwa NIEPOTWIERDZONA, nie ma go w Impulsum14 (prawdopodobnie FIFA-specific).
+# Klient wysyla 0x0001 i 0x0002 (oba zero-payloadowe) zaraz po getAccount, przed lookupUsersByPersonaNames,
+# i po tym NIC wiecej nie wysyla poza pingami -- to najbardziej prawdopodobny winowajca zamrozenia na
+# "Loading Seasons information...". Sesja 2026-09-25: sledzenie w Ghidrze funkcji FUN_009a3590 (tabela
+# nazw komend "GetCurrentSeasonID"/"StartSeason"/...) doprowadzilo do tabeli handlerow pod 0x024cb1a4,
+# ale okazala sie to byc lokalna tabela akcji skryptowych trybu kariery (Career Mode state machine), NIE
+# siec Blaze -- wiazanie command=1 -> GetCurrentSeasonID jest wiec TYLKO HIPOTEZA oparta na kolejnosci w
+# tabeli nazw, nie na potwierdzonym kodzie sieciowym. Ponizej: eksperyment empiryczny zamiast dalszej
+# statycznej analizy -- wysylamy niepusta odpowiedz z kilkoma kandydatami na tag naraz (TDF ignoruje
+# nieznane tagi) i sprawdzamy czy to cokolwiek zmienia w zachowaniu klienta.
+SEASONS_COMPONENT = 0x08C9
+GET_CURRENT_SEASON_ID_COMMAND = 0x0001
+START_SEASON_COMMAND = 0x0002
+_SEASON_ID_TAG_CANDIDATES = ("SEAS", "SNUM", "SIID", "CSID", "ID  ", "STAT")
+
 PERSONA_NAMESPACE = "cem_ea_id"
 DEFAULT_LOCALE = 1701724754        # 'enBR' -- taka wartosc klient wyslal w LANG w PreAuth
 AUTH_COMPONENT = 0x0001
@@ -357,6 +372,17 @@ def build_key_scopes_response(component: int, command: int, msg_num: int) -> byt
     KSIT) -- to trzecia komenda w tej samej serii getStatGroup/getKeyScopesMap/getStatsByGroupAsync,
     ktora klient wysyla przy wejsciu w Cup Match/Seasons, wiec tez potrzebuje typowanej odpowiedzi."""
     fields = [("KSIT", tdf.MAP, (tdf.STRING, tdf.STRUCT, []))]
+    payload = tdf.encode(fields)
+    return build_reply(component, command, msg_num, payload)
+
+
+def build_season_id_response(component: int, command: int, msg_num: int, season_id: int = 1) -> bytes:
+    """EKSPERYMENT (2026-09-25): odpowiedz na 0x08C9/0x0001 (przypuszczalnie GetCurrentSeasonId -- patrz
+    komentarz przy SEASONS_COMPONENT, wiazanie NIEPOTWIERDZONE). Wysylamy te sama wartosc pod kilkoma
+    prawdopodobnymi tagami naraz (TDF ignoruje nieznane tagi) zamiast dotychczasowej pustej odpowiedzi,
+    zeby sprawdzic empirycznie czy to odblokuje klienta po "Loading Seasons information...". Jesli nie
+    zadziala, potrzebna dalsza analiza w Ghidrze (zob. README, sekcja o komponencie 0x08C9)."""
+    fields = [(tag, tdf.VARINT, season_id) for tag in _SEASON_ID_TAG_CANDIDATES]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -656,6 +682,15 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif component == AUTH_COMPONENT and command == GET_ACCOUNT_COMMAND and identity is not None:
                     resp = build_get_account_response(component, command, msg_num, identity)
                     cap.note(f"-> wysylam GetAccountResponse (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                elif component == SEASONS_COMPONENT and command == GET_CURRENT_SEASON_ID_COMMAND:
+                    resp = build_season_id_response(component, command, msg_num)
+                    cap.note(f"-> EKSPERYMENT: wysylam niepusta odpowiedz na 0x08C9/0x0001 "
+                             f"(kilka kandydatow na tag naraz, Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
+                elif component == SEASONS_COMPONENT and command == START_SEASON_COMMAND:
+                    resp = build_reply(component, command, msg_num, b"")
+                    cap.note(f"-> odpowiadam pusto na 0x08C9/0x0002 (msg_num={msg_num}), "
+                             f"prawdopodobnie akcja bez danych zwrotnych")
                 elif component == USER_SESSIONS_COMPONENT and command == UPDATE_NETWORK_INFO_COMMAND:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> odpowiadam pusto na UserSessions::updateNetworkInfo (msg_num={msg_num})")
