@@ -329,22 +329,35 @@ def _find_field(fields, tag):
     return None
 
 
-def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
-    """Blaze::Stats::KeyScopedStatValues -- ladunek powiadomienia GetStatsAsyncNotification (0x0007/0x0032),
-    ksztalt potwierdzony w Impulsum14 (Blaze3SDK/Blaze/Stats/KeyScopedStatValues.cs + StatValues.cs).
-    Klient wysyla getStatsByGroupAsync (0x0007/0x0010) i dostaje na nie PUSTA odpowiedz Reply -- prawdziwe
-    dane (tu: pusta lista statystyk, bo nie mamy zadnych realnych danych sezonu) przychodza AS YNC jako ta
-    notyfikacja. LAST=1 sygnalizuje klientowi koniec strumienia (brak kolejnych paczek)."""
+def _stats_async_fields(group_name: str, view_id: int):
     stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, []))]
-    fields = [
+    return [
         ("GRNM", tdf.STRING, group_name),
         ("KEY ", tdf.STRING, ""),
         ("LAST", tdf.VARINT, 1),
         ("STS ", tdf.STRUCT, stat_values),
         ("VID ", tdf.VARINT, view_id),
     ]
-    payload = tdf.encode(fields)
+
+
+def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
+    """Blaze::Stats::KeyScopedStatValues -- ladunek powiadomienia GetStatsAsyncNotification (0x0007/0x0032),
+    ksztalt potwierdzony w Impulsum14 (Blaze3SDK/Blaze/Stats/KeyScopedStatValues.cs + StatValues.cs).
+    Klient wysyla getStatsByGroupAsync (0x0007/0x0010) i dostaje na nie PUSTA odpowiedz Reply -- prawdziwe
+    dane (tu: pusta lista statystyk, bo nie mamy zadnych realnych danych sezonu) przychodza AS YNC jako ta
+    notyfikacja. LAST=1 sygnalizuje klientowi koniec strumienia (brak kolejnych paczek)."""
+    payload = tdf.encode(_stats_async_fields(group_name, view_id))
     return build_notification(STATS_COMPONENT, GET_STATS_ASYNC_NOTIFICATION, payload)
+
+
+def build_stats_by_group_async_reply(component: int, command: int, msg_num: int,
+                                      group_name: str, view_id: int) -> bytes:
+    """EKSPERYMENT (2026-09-26): odpowiedz Reply na getStatsByGroupAsync (0x0007/0x0010) z tymi samymi
+    danymi co GetStatsAsyncNotification, zamiast pustego Reply. Log pokazuje ze klient po dotychczasowej
+    parze (pusty Reply + notification) po prostu milknie i zawiesza sie (baner RE-CONNECT po ~1s) -- test
+    czy oczekuje danych synchronicznie w samym Reply, a nie tylko async w osobnej notyfikacji."""
+    payload = tdf.encode(_stats_async_fields(group_name, view_id))
+    return build_reply(component, command, msg_num, payload)
 
 
 def build_stat_group_response(component: int, command: int, msg_num: int, group_name: str) -> bytes:
@@ -742,9 +755,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             group_name = v
                         elif tag == "VID":
                             view_id = v
-                    resp = build_reply(component, command, msg_num, b"")
-                    cap.note(f"-> odpowiadam pusto na Stats::getStatsByGroupAsync (msg_num={msg_num}), "
-                             f"grupa={group_name!r} (z ostatniego getStatGroup)")
+                    resp = build_stats_by_group_async_reply(component, command, msg_num, group_name, view_id)
+                    cap.note(f"-> EKSPERYMENT: odpowiadam na Stats::getStatsByGroupAsync danymi w Reply "
+                             f"(nie pusto, msg_num={msg_num}), grupa={group_name!r} "
+                             f"(z ostatniego getStatGroup), {len(resp)-HDR_LEN}B payloadu")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
                                     build_stats_async_notification(group_name, view_id)))
                 else:
