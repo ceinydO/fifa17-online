@@ -966,17 +966,22 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                       and identity is not None):
                     # GameManager::createGame -- KLIENT WYSYLA TO PO KLIKNIECIU "Play Match", SERWER
                     # DOTAD ODPOWIADAL PUSTO (fallback ponizej), stad zawieszenie na "Sending match
-                    # invite and creating a game session". CreateGameRequest.cs z Impulsum14 NIE
-                    # zawiera pol PNET/XNET/PLJD widocznych w realnym przechwycie (prawdopodobnie
-                    # roznica wersji SDK FIFA17 vs FIFA14 PC) -- zamiast zgadywac ich ksztalt, czytamy
-                    # tylko pola KTORE potwierdzone istnieja w obu (GNAM/VSTR/PMAX) i budujemy reszte
-                    # (kto jest zapraszany) z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie
-                    # dwoch graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
+                    # invite and creating a game session". Realny ksztalt zadania FIFA17 (potwierdzony
+                    # na drucie, sesja 2026-09-26) rozni sie od CreateGameRequest.cs z Impulsum14:
+                    # klient opakowuje dane w CMGD {GGTY,GVER,OSID,PNET,XNET} i GMCD {ATTR,CRIT,GNAM,
+                    # GSET,NTOP,PMAX,PMIN,PRES,QCAP,...} zamiast pol plaskich na najwyzszym poziomie --
+                    # GNAM/PMAX/NTOP sa WEWNATRZ GMCD, GVER (nie VSTR) jest wewnatrz CMGD. PLJD.PLDL
+                    # zawiera TYLKO wlasny wpis gracza-tworcy (USID.NAME='odyniec' w przechwycie), NIE
+                    # tozsamosc zapraszanego -- ten kto ma zostac zaproszony nie jest w tym zadaniu wcale,
+                    # wiec budujemy to z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie dwoch
+                    # graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
                     # zalogowanego gracza -- to decyzja logiki serwera, nie zalozenie co do protokolu.
                     host_name = identity[0]
-                    game_name = _find_field(fields, "GNAM") or f"{host_name}'s game"
-                    proto_version = _find_field(fields, "VSTR") or ""
-                    max_players = _find_field(fields, "PMAX") or 2
+                    gmcd_v = _find_field(fields, "GMCD") or []
+                    cmgd_v = _find_field(fields, "CMGD") or []
+                    game_name = _find_field(gmcd_v, "GNAM") or f"{host_name}'s game"
+                    proto_version = _find_field(cmgd_v, "GVER") or ""
+                    max_players = _find_field(gmcd_v, "PMAX") or 2
 
                     with _GAMES_LOCK:
                         game_id = _next_game_id[0]
@@ -1007,8 +1012,9 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             slot_id=len(roster), team_index=1))
                         invited.append(other_name)
 
+                    network_topology = _find_field(gmcd_v, "NTOP") or 130
                     game_data = build_replicated_game_data(game_id, game_name, host_ip, host_port,
-                                                            max_players, proto_version)
+                                                            max_players, proto_version, network_topology)
                     extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)",
                                     build_notify_game_setup(game_data, roster, setup_reason_disc=0)))
                     if invited:
