@@ -26,6 +26,7 @@ odtwarza wzorzec `Fire2Frame::reply()` z grid-leak/blaze.
 """
 from __future__ import annotations
 
+import hashlib
 import socket
 import ssl
 import time
@@ -175,19 +176,41 @@ def build_notification(component: int, command: int, payload: bytes) -> bytes:
     return build_header(len(payload), component, command, 0, msg_type=MSG_NOTIFICATION) + payload
 
 
-def build_user_identification(identity):
+def _persona_user_id(name: str) -> int:
+    """Stabilny falszywy UID dla persony INNEJ niz lokalnie zalogowana sesja (multi-gracz, np. dwie
+    instancje RPCS3 polaczone przez RPCN) -- unika kolizji z LOCAL_USER_ID/LOCAL_PERSONA_ID, ktore sa
+    zarezerwowane dla wlasnej tozsamosci polaczonej sesji. Bez tego kazdy gracz dostawal identyczny
+    BlazeId, wiec np. lookupUsersByPersonaNames('odyniec') wykonane przez sesje 'reinoldo' zwracalo
+    wpis z tym samym ID co sesja reinoldo -- klient wykrywal sprzecznosc (ten sam BlazeId, inna nazwa
+    persony niz wlasna) i padal (rozlaczenie ~10-20s po odpowiedzi)."""
+    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
+    return 2000000000 + (h % 1000000000)
+
+
+def identity_for_persona(name: str, own_identity):
+    """Zwraca (nazwa, ext_id, blob, uid, persona_id) dla podanej nazwy persony -- jesli to wlasna
+    tozsamosc biezacej sesji, uzywa prawdziwych LOCAL_USER_ID/LOCAL_PERSONA_ID i EXTI/EXTB z loginu;
+    w przeciwnym razie generuje spojny, unikalny falszywy identyfikator (patrz _persona_user_id)."""
+    own_name, own_ext_id, own_blob = own_identity
+    if name == own_name:
+        return name, own_ext_id, own_blob, LOCAL_USER_ID, LOCAL_PERSONA_ID
+    uid = _persona_user_id(name)
+    return name, 0, b"", uid, uid + 1
+
+
+def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
     """Blaze::UserIdentification (9 pol, ksztalt potwierdzony w NotifyUserAdded z realnego ruchu)."""
     name, ext_id, blob = identity
     return [
-        ("AID ", tdf.VARINT, LOCAL_USER_ID),
+        ("AID ", tdf.VARINT, uid),
         ("ALOC", tdf.VARINT, DEFAULT_LOCALE),
         ("EXBB", tdf.BLOB, blob),
         ("EXID", tdf.VARINT, ext_id),
-        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("ID  ", tdf.VARINT, uid),
         ("NAME", tdf.STRING, name),
         ("NASP", tdf.STRING, PERSONA_NAMESPACE),
         ("ORIG", tdf.VARINT, 0),
-        ("PIDI", tdf.VARINT, LOCAL_PERSONA_ID),
+        ("PIDI", tdf.VARINT, persona_id),
     ]
 
 
@@ -199,7 +222,7 @@ def build_user_added(identity) -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
-def build_user_data(identity):
+def build_user_data(identity, uid: int = LOCAL_USER_ID):
     """Blaze::UserManager::UserData -- INNY typ niz UserIdentification. Znaleziony sesja 9 poprzez
     find_tdf_members.py przeszukujac tabele refleksji pod katem pol UserIdentification: zaraz PO tej
     tabeli w EBOOT (0x0254DD4C-0x0254DE04) siedzi OSOBNA tabela pol z dokladnie 6 tagami w tej kolejnosci:
@@ -212,14 +235,15 @@ def build_user_data(identity):
     return [
         ("EXBB", tdf.BLOB, blob),
         ("EXID", tdf.VARINT, ext_id),
-        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("ID  ", tdf.VARINT, uid),
         ("NAME", tdf.STRING, name),
         ("NASP", tdf.STRING, PERSONA_NAMESPACE),
         ("FLGS", tdf.VARINT, USER_FLAG_ONLINE),
     ]
 
 
-def build_lookup_users_response(component: int, command: int, msg_num: int, identity) -> bytes:
+def build_lookup_users_response(component: int, command: int, msg_num: int, own_identity,
+                                 persona_names) -> bytes:
     """Odpowiedz na UserSessions::lookupUsersByPersonaNames (typ zadania Blaze::LookupUsersByPersonaNamesRequest
     potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa i ksztalt
     pola-listy przez dlugi czas NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko
@@ -245,15 +269,30 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, iden
 
     Wysylamy ULST jako LIST<UserData> (najwyzszy priorytet -- potwierdzona nazwa pola z Impulsum14 +
     potwierdzony w EBOOT ksztalt struktury) razem z poprzednimi wariantami pod USER/VALU/DATA/LIST (TDF
-    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna)."""
-    identity_struct = build_user_identification(identity)
-    user_data_struct = build_user_data(identity)
-    fields = [("ULST", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
-    fields.append(("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct])))
+    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna).
+
+    KRYTYCZNA POPRAWKA (multi-gracz, dwie instancje RPCS3 polaczone przez RPCN): wczesniej ta funkcja
+    ZAWSZE zwracala wlasna tozsamosc biezacej sesji (identity) z tym samym sztywnym LOCAL_USER_ID,
+    ignorujac pole PLST z zadania (liste FAKTYCZNIE szukanych nazw person). Gdy gracz A szukal gracza B,
+    dostawal z powrotem dane gracza A pod tym samym BlazeId co jego wlasna sesja -- SDK Blaze wykrywalo
+    sprzecznosc (ten sam BlazeId, inna nazwa niz wlasna) i klient sie rozlaczal ~10-20s po odpowiedzi.
+    Teraz budujemy wpis dla KAZDEJ nazwy z PLST osobno: dla wlasnej nazwy uzywamy prawdziwej tozsamosci
+    (LOCAL_USER_ID), dla kazdej innej -- stabilnego, unikalnego falszywego ID (patrz identity_for_persona/
+    _persona_user_id), zeby uniknac kolizji identyfikatorow miedzy graczami."""
+    if not persona_names:
+        persona_names = [own_identity[0]]
+    identity_structs = []
+    user_data_structs = []
+    for name in persona_names:
+        p_name, p_ext_id, p_blob, uid, persona_id = identity_for_persona(name, own_identity)
+        identity_structs.append(build_user_identification((p_name, p_ext_id, p_blob), uid, persona_id))
+        user_data_structs.append(build_user_data((p_name, p_ext_id, p_blob), uid))
+    fields = [("ULST", tdf.LIST, (tdf.STRUCT, user_data_structs))]
+    fields.append(("USER", tdf.LIST, (tdf.STRUCT, user_data_structs)))
     for tag in _LOOKUP_TAG_CANDIDATES:
         if tag == "USER":
             continue
-        fields.append((tag, tdf.LIST, (tdf.STRUCT, [identity_struct])))
+        fields.append((tag, tdf.LIST, (tdf.STRUCT, identity_structs)))
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -730,9 +769,12 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                                            dbps=dbps, ubps=ubps, natt=natt)))
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
-                    resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: ULST=LIST<UserData> "
-                             f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
+                    plst_v = _find_field(fields, "PLST")
+                    persona_names = list(plst_v[1]) if plst_v else []
+                    resp = build_lookup_users_response(component, command, msg_num, identity, persona_names)
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames dla {persona_names!r} "
+                             f"[HIPOTEZA: ULST=LIST<UserData> (tag z Impulsum14, ksztalt "
+                             f"EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
                              f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_STAT_GROUP_COMMAND:
