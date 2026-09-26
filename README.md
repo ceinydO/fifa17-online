@@ -15,17 +15,29 @@ game itself.
 > source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
 > session (human or Claude) does not have to re-derive it from scratch.
 
-## Current status (as of 2026-09-24)
+## Current status (as of 2026-09-26)
 
 The full PS3 client login handshake **works end-to-end**: redirector → TLS → PreAuth → Ping →
 fetchClientConfig → fake Nucleus OAuth → Blaze login → account/session notifications → main Online
 menu is reachable and playable-looking (Continue → checkbox → OK gets you into the FIFA17 Online
 menu with PLAY SEASON / ONLINE FRIENDLIES / CURRENT SEASON / TROPHY ROOM / PLAY CUP MATCH tiles).
 
-**Open problem, unresolved:** selecting **"Play Cup Match"** takes the client to a stadium loading
-screen that gets stuck forever on **"Loading Seasons information..."**. Selecting **"PLAY SEASON"**
-instead shows a **blank screen** (a different failure mode, not yet investigated). See
-"Current blocker" below for everything captured about this so far and the open theories.
+**Play Cup Match / Play Season** are still stuck (see "Current blocker" below) — that investigation
+is unchanged from 2026-09-25 and still needs the Ghidra work described there.
+
+**Online Friendlies got significantly further this session (2026-09-26), with two real players
+over Radmin VPN** — see "Online Friendlies: GameManager `createGame`" below for the full writeup.
+Short version: two separate RPCS3 instances (different physical PCs, connected via Radmin VPN) can
+both log in, see each other in the friends list (RCPN-backed presence, not our fake Blaze), and
+open Match Settings. Clicking **"PLAY MATCH"** sends `GameManager::createGame` (component `0x0004`),
+which the server previously left completely unhandled (empty Reply) — now implemented (see below).
+**Still unresolved:** even with a correct `CreateGameResponse` + `NotifyGameSetup` reply, the client
+does not visibly leave the "Sending match invite and creating a game session. Please wait..."
+screen in solo testing (host only, no second player actually connected) — current best theory is
+that the wait screen is *also* gated on a real RPCN friend-presence check (`sceNpBasicGetFriendPresenceByIndex`,
+which the client polls roughly once per second in a background thread) succeeding for the invited
+friend, which is **not** something our fake Blaze server can influence — untested with both players
+online simultaneously.
 
 ## Architecture
 
@@ -196,6 +208,168 @@ except possibly the current blocker.
   - Notifications, all **[CONFIRMED]** patterns (sent unprompted after login):
     `UserAuthenticated` (`0x0008`), `NotifyUserAdded` (`0x0002`), `UserUpdated` (`0x0005`),
     `UserSessionExtendedDataUpdate` (`0x0001`).
+
+## Online Friendlies: GameManager `createGame` (2026-09-26)
+
+**Setup used for this testing:** the user has a friend with their own physical PC and their own
+legitimate FIFA 17 disc/ISO. Both machines run RPCS3 and connect over **Radmin VPN** (already
+installed, host VPN IP `26.76.101.213`) instead of a VM — an earlier attempt to run two RPCS3
+instances on one machine inside a VirtualBox VM was abandoned after VirtualBox's virtual GPU could
+not create the OpenGL context RPCS3 needs (`Failed to create OpenGL context`, then a full VM freeze
+even with 3D Acceleration + `VBoxSVGA` enabled). Both players' clients connect to the **same**
+`fifa17srv` instance (run by the host, `blaze_advertise_host` set to the Radmin VPN IP so the
+friend's hosts-file redirect reaches it).
+
+**Confirmed working, end-to-end, with two distinct real clients:** full Blaze handshake for both
+players (redirector → PreAuth → login → UserSessions → Stats), each player's client shows the other
+in the "Online Friendlies" friends list (this friends-list presence comes from **RCPN**, i.e. the
+real PS3 online emulation layer, not from anything our Blaze server sends), "Current Season" stats
+screen renders for both. Clicking a friend → "PLAY MATCH" opens Match Settings (Half Length, etc.)
+and an all-time stats comparison screen; clicking through that sends the request described below.
+
+### Real `createGame` request shape (confirmed on the wire, differs from Impulsum14)
+
+`GameManager::createGame` is component `0x0004`, command `0x0001` (confirmed via Impulsum14's
+`Components/GameManagerBase.json`: component Id 4, method Id 1, request `CreateGameRequest`,
+response `CreateGameResponse`). **The real FIFA17 request does *not* match Impulsum14's
+`CreateGameRequest.cs` field layout** (that reference is FIFA 14 PC, an older Blaze 13 SDK build —
+plausibly a different SDK minor version for this particular request shape). The real wire capture
+looks like this instead (top-level fields, abbreviated):
+
+```
+CMGD <struct>            -- NOT in Impulsum14's CreateGameRequest.cs at all
+  GGTY <varint>
+  GVER <string>           -- e.g. 'qa-only' -- this is GameProtocolVersionString, NOT top-level VSTR
+  OSID <varint>
+  PNET <union>            -- host's own NetworkAddress (IpPairAddress, disc=2)
+  XNET <union disc=127>   -- unset
+GCTR <string>
+GMCD <struct>             -- NOT in Impulsum14's CreateGameRequest.cs at all
+  ATTR <map string->string>   -- OSDK_gameMode, fifaHalfLength, fifaMatchupHash, etc.
+  CRIT <map string->string>
+  GMRG <varint>
+  GNAM <string>            -- game name -- lives HERE, not top-level
+  GSET <varint>            -- bitflag combination (observed 1060), not a simple enum
+  NTOP <varint>            -- network topology -- lives HERE, not top-level
+  PMAX <varint>             -- max players -- lives HERE, not top-level
+  PMIN <varint>
+  PRES <varint>
+  QCAP <varint>
+  RNFO <struct>
+  STMN <string>
+  VOIP <varint>
+GTYP <string>              -- e.g. 'gameType20'
+GURL <string>
+NRES <varint>
+PCAP <list of varint>
+PGID <string>
+PGSC <blob>
+PLJD <struct>              -- NOT in Impulsum14's CreateGameRequest.cs; carries ONLY the HOST's
+  BTPL <objid>              own UserIdentification (a self-entry, not the invited friend's identity)
+  DFRL <string>
+  GENT <varint>
+  PLDL <list of struct>     -- one element observed: {IREP, RLNM, USID: UserIdentification}
+  SLOT <varint>
+  TID <varint>
+  TIDX <varint>
+TIDS <list of varint>
+```
+
+**Important, don't re-derive this the hard way:** `PLJD.PLDL` carries only the *creator's own*
+identity, not the invited friend's — so this request does **not** tell the server who to invite.
+Whatever decides the invite target must happen client-side before this request is even sent (most
+likely from the friends-list/RPCN selection the player made on the "PLAY MATCH" screen), and the
+server has no way to read it off this wire message.
+
+### Server implementation added this session
+
+`fifa17srv/blaze.py` now implements the `GameManager::createGame` handler (previously fell through
+to the generic empty-Reply fallback, which is the confirmed root cause of the earlier hang on
+"Sending match invite and creating a game session. Please wait..."):
+
+- **`CreateGameResponse {GID}`** — the *only* field, confirmed 1:1 against Impulsum14's
+  `CreateGameResponse.cs` (a `UInt32`).
+- **`NotifyGameSetup {GAME, PROS, QUEU, REAS}`** (component `0x0004`, notification id `0x0014`/20)
+  — shape confirmed against Impulsum14's `NotifyGameSetup.cs`, `ReplicatedGameData.cs`,
+  `ReplicatedGamePlayer.cs`, `GameSetupReason.cs`, `NetworkAddress.cs`/`IpPairAddress.cs`/
+  `IpAddress.cs`. `REAS` disc=0 (`DatalessSetupContext`) is sent to the game's creator; disc=2
+  (`IndirectJoinGameSetupContext`) to anyone invited without having called `createGame`/`joinGame`
+  themselves — these are Blaze-protocol-valid union variants, the *choice* between them for a given
+  recipient is server-side game-flow logic, not a wire-format guess.
+- **Cross-connection player registry** (`_PLAYERS`, a module-level dict keyed by persona name,
+  protected by `_PLAYERS_LOCK`): each connection registers itself on login (storing its `stream`,
+  a per-connection `send_lock`, and the IP/port harvested from `UserSessions::updateNetworkInfo`).
+  This is new — until this session, `blaze.py`'s `handle()` had **zero shared state across
+  connections**, so one player's `createGame` had no way to reach another player's live connection
+  thread to push a notification. `_send_frame()` looks up a persona name and pushes a frame from
+  any thread, using that connection's own `send_lock` so pushed notifications never interleave with
+  that connection's own replies mid-frame.
+- **Who gets invited, since the request itself doesn't say:** the server invites *every other
+  currently-logged-in player* — in this project's actual usage (exactly two real people, host +
+  one RPCN friend) that's always exactly one person. This is a deliberate, documented server-side
+  design choice for this project's known 2-player use case, not a guess about what the protocol
+  field layout means.
+- `UserSessions::updateNetworkInfo`'s handler now also extracts the client's own `IP` (not just
+  `PORT`/`MACI` as before) from the `INIP` sub-struct and stores it in the player registry, so the
+  `ReplicatedGamePlayer`/`ReplicatedGameData` sent in `NotifyGameSetup` can carry real (Radmin VPN)
+  IP:port pairs for P2P, not just loopback placeholders.
+
+**Tested live (solo, host only — see "Still needs testing with both players online" below):** the
+server correctly builds and sends `CreateGameResponse GID=1` followed by `NotifyGameSetup` (host,
+`DatalessSetupContext`, roster of 1) — confirmed byte-correct via the server's own capture log and
+a local `tdf.decode`/`pretty` round-trip test. Because only the host was connected to the fake
+Blaze server during this test (the friend wasn't running FIFA17 at the time), the "invite the other
+player" branch never exercised — the log correctly showed
+`UWAGA: brak innych zalogowanych graczy do zaproszenia do gry <id>` ("no other logged-in players to
+invite to game `<id>`").
+
+**Even with this fix, the client did not visibly leave the "Please wait..." screen in this solo
+test.** Two live tests (with slightly different `NotifyGameSetup` payload sizes as the field-parsing
+was corrected mid-session) both showed the same result: the wait screen stayed up indefinitely after
+the server's response, per the user's direct confirmation ("gra dziala normalnie caly czas na oknie
+sending game invite" — the game just keeps sitting on that screen).
+
+### New theory: RPCN friend-presence polling, not (only) a Blaze issue
+
+Grepping the RPCS3 native log (`RPCS3.log`) from the same test run shows the client's `sceNp` layer
+calling, roughly once per second in a background thread (correlated with the periodic `PERF: CPU
+Usage` log lines):
+
+```
+sceNp: sceNpBasicGetFriendPresenceByIndex(index=0, user=*0x14a2af08, pres=*0x14a30368, options=0)
+```
+
+This is a **real RPCN (PS3 online emulation) presence check** for the friend at index 0 — separate
+infrastructure entirely from our fake Blaze server, which cannot see or influence it. Since the
+friend wasn't actually connected to RPCN during this specific solo test, this check most likely
+keeps reporting "offline"/no data. **Working theory, not yet confirmed:** the "Sending match invite
+and creating a game session" screen may be gated on *both* (a) a correct Blaze
+`createGame`/`NotifyGameSetup` round-trip (now implemented) *and* (b) RPCN confirming the invited
+friend is actually online and reachable — which is entirely outside this project's fake-Blaze-server
+control and can only be satisfied by the friend genuinely being online via RPCN at the same time.
+
+**This has not been tested with both players simultaneously online yet** (the friend wasn't
+available during this session's live tests). That is the concrete next step before drawing further
+conclusions about whether the `createGame`/`NotifyGameSetup` implementation actually unblocks the
+flow — solo testing can only prove the server-side code runs without crashing/error, not that it's
+sufficient.
+
+**Next steps, in order:**
+1. Test with both players online simultaneously (both in RPCN, both connected to the same
+   `fifa17srv` instance) and watch whether the invited player's client receives
+   `NotifyGameSetup (zaproszony, IndirectJoinGameSetupContext)` and whether either client leaves the
+   "Please wait" screen.
+2. If it's still stuck with both players online, the RPCN-presence theory above is falsified (or at
+   least insufficient) and the investigation goes back to the Blaze wire level — e.g. checking
+   whether the client expects `GameManager::joinGame` to be called somehow, or a different
+   `NotifyGameSetup`/`GameSetupReason` variant, or additional fields in `ReplicatedGameData` we
+   currently omit (only a subset of `ReplicatedGameData.cs`'s ~34 fields are populated today).
+3. If the friend's presence really is the gate, there is likely nothing to fix in `fifa17srv`
+   itself for this specific screen — it would mean this part of the flow was already correctly
+   implemented and just needs a genuinely-online second player to proceed, at which point the next
+   question becomes what happens *after* both clients leave this screen (probably `joinGame`, then
+   real P2P connection setup using the `PNET`/`ReplicatedGameData.HNET` addresses already being
+   exchanged).
 
 ## Current blocker: "Loading Seasons information..." freeze
 
@@ -842,9 +1016,12 @@ update_and_run.ps1        one-command pull + run for repeat testing
 1. ~~Capture redirector + first Blaze packets.~~ Done.
 2. ~~Confirm frame format; implement PreAuth / Ping / Authentication responses.~~ Done.
 3. ~~Get the client to a logged-in main menu with a local fake profile.~~ Done.
-4. **Current:** get past the Online menu into an actual match (Cup Match freeze / Season blank
-   screen — see "Current blocker" above).
-5. Online friendlies: lobby, invite, matchmaking, session hand-off (P2P vs relayed TBD).
+4. Get past the Online menu into an actual match (Cup Match freeze / Season blank screen — see
+   "Current blocker" above). **Still stuck, unrelated to Online Friendlies progress below.**
+5. **Current:** Online friendlies: lobby, invite, matchmaking, session hand-off (P2P vs relayed
+   TBD). `GameManager::createGame` implemented (see "Online Friendlies" section above); still
+   needs a live two-player test to confirm it actually unblocks the "Please wait" screen, then
+   `joinGame` and real P2P address exchange.
 6. Docs of the protocol (clean-room notes, no EA code).
 
 ## Related work
