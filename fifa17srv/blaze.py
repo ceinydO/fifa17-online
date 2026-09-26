@@ -81,13 +81,6 @@ GET_KEY_SCOPES_MAP_COMMAND = 0x000F                # StatsComponentCommand.getKe
 GET_STATS_BY_GROUP_ASYNC_COMMAND = 0x0010          # StatsComponentCommand.getStatsByGroupAsync = 16
 GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.GetStatsAsyncNotification = 50
 
-# DIAGNOSTYKA: nazwa i ksztalt pola-listy w odpowiedzi na lookupUsersByPersonaNames NIE sa potwierdzone
-# w EBOOT (zob. komentarz przy build_lookup_users_response). Sesja 9: przetestowano 4 kandydatow na tag
-# (USER/VALU/DATA/LIST) pojedynczo przez zmienna BLAZE_LOOKUP_TAG, wszystkie jako tdf.LIST -- zaden nie
-# dal widocznego postepu. Zamiast zgadywac po kolei, build_lookup_users_response wysyla teraz wszystkie
-# warianty naraz (TDF ignoruje nieznane tagi), wiec ta zmienna juz nic nie wybiera.
-_LOOKUP_TAG_CANDIDATES = ("USER", "VALU", "DATA", "LIST")
-
 # Komponent 0x08C9 (2249) -- nazwa NIEPOTWIERDZONA, nie ma go w Impulsum14 (prawdopodobnie FIFA-specific).
 # Klient wysyla 0x0001 i 0x0002 (oba zero-payloadowe) zaraz po getAccount, przed lookupUsersByPersonaNames,
 # i po tym NIC wiecej nie wysyla poza pingami -- to najbardziej prawdopodobny winowajca zamrozenia na
@@ -280,9 +273,22 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, own_
     priorytet, bo pochodzi z dzialajacego, potwierdzonego kodu serwera Blaze innej gry EA z tej samej
     rodziny SDK, nie z domyslu.
 
-    Wysylamy ULST jako LIST<UserData> (najwyzszy priorytet -- potwierdzona nazwa pola z Impulsum14 +
-    potwierdzony w EBOOT ksztalt struktury) razem z poprzednimi wariantami pod USER/VALU/DATA/LIST (TDF
-    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna).
+    Wysylamy WYLACZNIE ULST jako LIST<UserData> (potwierdzona nazwa pola z Impulsum14 + potwierdzony
+    w EBOOT ksztalt struktury).
+
+    USUNIETO (2026-09-26) shotgun fallback pod tagami USER/VALU/DATA/LIST z UserIdentification --
+    zalozenie "TDF ignoruje nieznane tagi, wiec to bezpieczne" okazalo sie falszywe w multi-gracz
+    scenariuszu: RPCS3 log pokazal deterministyczny PPU access violation na FEThread, zawsze pod
+    TYM SAMYM adresem (0x2ef598, instrukcja `lwz r3,0x90(r31)` -- odczyt pola pod stalym przesunieciem
+    z obiektu, ktorego wskaznik (r31) jest null/zly), niezalezny od tresci EXBB/EXID ktore probowalismy
+    naprawiac wczesniej. Skoro crash jest identyczny przy dwoch roznych tresciach danych, ale WYSTEPUJE
+    dopiero odkad odpowiedz zawiera dane INNEGO gracza (nie tylko wlasna tozsamosc), najbardziej
+    prawdopodobnym podejrzanym staja sie redundantne pola USER/VALU/DATA/LIST -- kod klienta
+    (SDK Blaze/reflection) mogl brac jeden z tych tagow jako sygnal do zupelnie innej sciezki
+    przetwarzania (np. rejestracja obiektu sesji/kontaktu) niz przy odpowiedzi zawierajacej tylko
+    wlasna tozsamosc, i tworzyc/uzywac obiekt z nieprawidlowymi/pustymi polami. README juz potwierdzal
+    ULST jako jedyne zweryfikowane, potrzebne pole -- shotgun byl zabezpieczeniem "na wszelki wypadek"
+    z czasow zanim to potwierdzono, teraz jest tylko zbednym ryzykiem.
 
     KRYTYCZNA POPRAWKA (multi-gracz, dwie instancje RPCS3 polaczone przez RPCN): wczesniej ta funkcja
     ZAWSZE zwracala wlasna tozsamosc biezacej sesji (identity) z tym samym sztywnym LOCAL_USER_ID,
@@ -294,18 +300,11 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, own_
     _persona_user_id), zeby uniknac kolizji identyfikatorow miedzy graczami."""
     if not persona_names:
         persona_names = [own_identity[0]]
-    identity_structs = []
     user_data_structs = []
     for name in persona_names:
         p_name, p_ext_id, p_blob, uid, persona_id = identity_for_persona(name, own_identity)
-        identity_structs.append(build_user_identification((p_name, p_ext_id, p_blob), uid, persona_id))
         user_data_structs.append(build_user_data((p_name, p_ext_id, p_blob), uid))
     fields = [("ULST", tdf.LIST, (tdf.STRUCT, user_data_structs))]
-    fields.append(("USER", tdf.LIST, (tdf.STRUCT, user_data_structs)))
-    for tag in _LOOKUP_TAG_CANDIDATES:
-        if tag == "USER":
-            continue
-        fields.append((tag, tdf.LIST, (tdf.STRUCT, identity_structs)))
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -786,9 +785,9 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     persona_names = list(plst_v[1]) if plst_v else []
                     resp = build_lookup_users_response(component, command, msg_num, identity, persona_names)
                     cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames dla {persona_names!r} "
-                             f"[HIPOTEZA: ULST=LIST<UserData> (tag z Impulsum14, ksztalt "
-                             f"EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
-                             f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
+                             f"[ULST=LIST<UserData> (tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS "
+                             f"z EBOOT), bez shotgun fallback USER/VALU/DATA/LIST -- patrz komentarz przy "
+                             f"build_lookup_users_response] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_STAT_GROUP_COMMAND:
                     group_name = ""

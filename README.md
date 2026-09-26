@@ -175,14 +175,20 @@ except possibly the current blocker.
   FIFA-specific and untouched so far.
 
 - **`0x7802` UserSessions** (`USER_SESSIONS_COMPONENT`)
-  - `0x0032` lookupUsersByPersonaNames **[HYPOTHESIS]** → sends `ULST = LIST<UserData>` (tag name
+  - `0x0032` lookupUsersByPersonaNames → sends **only** `ULST = LIST<UserData>` (tag name
     `ULST` confirmed via Impulsum14's `UserDataResponse.cs`; the `UserData` struct shape
     `EXBB/EXID/ID/NAME/NASP/FLGS` read directly from EBOOT reflection data next to
-    `UserIdentification`'s) as the priority field, **plus** a shotgun fallback of
-    `USER/VALU/DATA/LIST` tags with the older `UserIdentification` shape, in case the client
-    actually wants one of those instead. This response format is the least confidently verified
-    of the "working" pieces — it visibly works (client proceeds), but which of the two field sets
-    the client is actually reading was never isolated.
+    `UserIdentification`'s). **Update 2026-09-26:** used to also send a shotgun fallback of
+    `USER/VALU/DATA/LIST` tags with the older `UserIdentification` shape "just in case" (left
+    over from before `ULST` was confirmed). In the two-RPCS3-instance multiplayer test this
+    caused a deterministic PPU access violation on the client's `FEThread`, always at the exact
+    same address (`0x2ef598`, `lwz r3,0x90(r31)` — reading a fixed field offset off a
+    null/bad object pointer), reproduced across 4 separate runs regardless of what content we put
+    in `EXBB`/`EXID`. The crash only appeared once the response started carrying another player's
+    (non-self) identity data, so the redundant `USER/VALU/DATA/LIST` fields — never needed once
+    `ULST` was confirmed — are the prime suspect: some reflection/decoder path in the client likely
+    picked one of them up as a different, unintended structure. Removed the shotgun fallback
+    entirely; not yet re-verified live.
   - `0x0014` updateNetworkInfo **[CONFIRMED pattern]** → empty `Reply` + `UserSessionExtendedDataUpdate`
     notification (`0x0001`). Observed **twice** per connection: once right after login with
     placeholder NAT info (`NATT=5`), once later after QoS probing on port 17502 with real results
