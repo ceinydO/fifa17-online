@@ -26,14 +26,18 @@ odtwarza wzorzec `Fire2Frame::reply()` z grid-leak/blaze.
 """
 from __future__ import annotations
 
+import hashlib
 import socket
 import ssl
+import threading
 import time
 
 from . import tdf
 from .config import Config
 from .qos import QOS_PORT
 from .server import Capture, negotiate
+
+_LOOPBACK_IP_U32 = int.from_bytes(socket.inet_aton("127.0.0.1"), "big")  # 2130706433
 
 UTIL_COMPONENT = 0x0009
 PRE_AUTH_COMMAND = 0x0007
@@ -78,12 +82,74 @@ GET_KEY_SCOPES_MAP_COMMAND = 0x000F                # StatsComponentCommand.getKe
 GET_STATS_BY_GROUP_ASYNC_COMMAND = 0x0010          # StatsComponentCommand.getStatsByGroupAsync = 16
 GET_STATS_ASYNC_NOTIFICATION = 0x0032              # StatsComponentNotification.GetStatsAsyncNotification = 50
 
-# DIAGNOSTYKA: nazwa i ksztalt pola-listy w odpowiedzi na lookupUsersByPersonaNames NIE sa potwierdzone
-# w EBOOT (zob. komentarz przy build_lookup_users_response). Sesja 9: przetestowano 4 kandydatow na tag
-# (USER/VALU/DATA/LIST) pojedynczo przez zmienna BLAZE_LOOKUP_TAG, wszystkie jako tdf.LIST -- zaden nie
-# dal widocznego postepu. Zamiast zgadywac po kolei, build_lookup_users_response wysyla teraz wszystkie
-# warianty naraz (TDF ignoruje nieznane tagi), wiec ta zmienna juz nic nie wybiera.
-_LOOKUP_TAG_CANDIDATES = ("USER", "VALU", "DATA", "LIST")
+# Komponent 0x08C9 (2249) -- nazwa NIEPOTWIERDZONA, nie ma go w Impulsum14 (prawdopodobnie FIFA-specific).
+# Klient wysyla 0x0001 i 0x0002 (oba zero-payloadowe) zaraz po getAccount, przed lookupUsersByPersonaNames,
+# i po tym NIC wiecej nie wysyla poza pingami -- to najbardziej prawdopodobny winowajca zamrozenia na
+# "Loading Seasons information...". Sesja 2026-09-25: sledzenie w Ghidrze funkcji FUN_009a3590 (tabela
+# nazw komend "GetCurrentSeasonID"/"StartSeason"/...) doprowadzilo do tabeli handlerow pod 0x024cb1a4,
+# ale okazala sie to byc lokalna tabela akcji skryptowych trybu kariery (Career Mode state machine), NIE
+# siec Blaze -- wiazanie command=1 -> GetCurrentSeasonID jest wiec TYLKO HIPOTEZA oparta na kolejnosci w
+# tabeli nazw, nie na potwierdzonym kodzie sieciowym. Ponizej: eksperyment empiryczny zamiast dalszej
+# statycznej analizy -- wysylamy niepusta odpowiedz z kilkoma kandydatami na tag naraz (TDF ignoruje
+# nieznane tagi) i sprawdzamy czy to cokolwiek zmienia w zachowaniu klienta.
+SEASONS_COMPONENT = 0x08C9
+GET_CURRENT_SEASON_ID_COMMAND = 0x0001
+START_SEASON_COMMAND = 0x0002
+_SEASON_ID_TAG_CANDIDATES = ("SEAS", "SNUM", "SIID", "CSID", "ID  ", "STAT")
+
+# Blaze::GameManager -- komponent 0x0004, potwierdzony w Impulsum14 (Components/GameManagerBase.json,
+# "Id": 4) I na drucie (realny przechwyt: klient po ekranie "Play Match" wysyla component=0x0004
+# command=0x0001, ktore u nas wpadalo w ogolny fallback i dostawalo pusta odpowiedz -- stad zawieszenie
+# na "Sending match invite and creating a game session"). createGame = method Id 1 (CreateGameRequest/
+# CreateGameResponse), NotifyGameSetup = notification Id 20 (0x14) -- oba potwierdzone w tym samym pliku.
+GAME_MANAGER_COMPONENT = 0x0004
+CREATE_GAME_COMMAND = 0x0001
+NOTIFY_GAME_SETUP = 0x0014
+
+# Rejestr polaczonych graczy (nazwa persony -> stream/lock/adres), potrzebny zeby createGame wywolane
+# w watku jednego gracza moglo wypchnac powiadomienie NotifyGameSetup do watku DRUGIEGO gracza --
+# do tej pory kazde polaczenie bylo obslugiwane w calkowitej izolacji (zmienna `identity` byla lokalna
+# dla handle()). send_lock chroni WSZYSTKIE zapisy na danym streamie (wlasne odpowiedzi tego polaczenia
+# ORAZ asynchroniczne powiadomienia wpychane z watku innego gracza), zeby ramki nigdy sie nie przeplotly.
+_PLAYERS_LOCK = threading.Lock()
+_PLAYERS: dict = {}   # nazwa persony -> {"stream", "send_lock", "ip", "port"}
+_GAMES_LOCK = threading.Lock()
+_next_game_id = [1]
+
+
+def _register_player(name: str, stream, send_lock: threading.Lock) -> None:
+    with _PLAYERS_LOCK:
+        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0}
+
+
+def _unregister_player(name: str) -> None:
+    with _PLAYERS_LOCK:
+        _PLAYERS.pop(name, None)
+
+
+def _update_player_network(name: str, ip: int, port: int) -> None:
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+        if entry is not None:
+            entry["ip"], entry["port"] = ip, port
+
+
+def _send_frame(name: str, frame: bytes, cap: Capture, label: str) -> bool:
+    """Wypycha ramke (powiadomienie) do INNEGO gracza, z dowolnego watku."""
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+    if entry is None:
+        return False
+    try:
+        with entry["send_lock"]:
+            entry["stream"].sendall(frame)
+        cap.data("S->C", frame)
+        cap.note(f"-> wysylam {label} do {name!r}, {len(frame)-HDR_LEN}B payloadu")
+        return True
+    except OSError as exc:
+        cap.note(f"-> blad wysylki {label} do {name!r}: {exc}")
+        return False
+
 
 PERSONA_NAMESPACE = "cem_ea_id"
 DEFAULT_LOCALE = 1701724754        # 'enBR' -- taka wartosc klient wyslal w LANG w PreAuth
@@ -158,19 +224,54 @@ def build_notification(component: int, command: int, payload: bytes) -> bytes:
     return build_header(len(payload), component, command, 0, msg_type=MSG_NOTIFICATION) + payload
 
 
-def build_user_identification(identity):
+def _persona_user_id(name: str) -> int:
+    """Stabilny falszywy UID dla persony INNEJ niz lokalnie zalogowana sesja (multi-gracz, np. dwie
+    instancje RPCS3 polaczone przez RPCN) -- unika kolizji z LOCAL_USER_ID/LOCAL_PERSONA_ID, ktore sa
+    zarezerwowane dla wlasnej tozsamosci polaczonej sesji. Bez tego kazdy gracz dostawal identyczny
+    BlazeId, wiec np. lookupUsersByPersonaNames('odyniec') wykonane przez sesje 'reinoldo' zwracalo
+    wpis z tym samym ID co sesja reinoldo -- klient wykrywal sprzecznosc (ten sam BlazeId, inna nazwa
+    persony niz wlasna) i padal (rozlaczenie ~10-20s po odpowiedzi)."""
+    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
+    return 2000000000 + (h % 1000000000)
+
+
+def identity_for_persona(name: str, own_identity):
+    """Zwraca (nazwa, ext_id, blob, uid, persona_id) dla podanej nazwy persony -- jesli to wlasna
+    tozsamosc biezacej sesji, uzywa prawdziwych LOCAL_USER_ID/LOCAL_PERSONA_ID i EXTI/EXTB z loginu;
+    w przeciwnym razie generuje spojny, unikalny falszywy identyfikator (patrz _persona_user_id).
+
+    UWAGA (crash po poprawce kolizji BlazeId): pierwsza wersja zwracala tu ext_id=0, blob=b"" dla
+    kazdej persony innej niz wlasna. To odblokowalo dawny problem (kolizja BlazeId -> rozlaczenie),
+    ale ujawnilo NOWY: PPU access violation na FEThread (czytanie adresu 0x90 -- niski, stale
+    przesuniecie typowe dla odczytu pola ze struktury spod pustego/null wskaznika). EXBB (EXTB z
+    loginu) to najwyrazniej struktura o ustalonym ksztalcie (np. NpId), ktora klient parsuje zakladajac
+    minimalny rozmiar; pusty blob (0 bajtow) daje wskaznik null/za krotki bufor, wiec odczyt pola w
+    stalym przesunieciu (tu akurat 0x90) pada. Serwer nie zna PRAWDZIWEGO EXTB/EXTI drugiego gracza
+    (kazde polaczenie jest obslugiwane osobno, bez wspoldzielonego stanu sesji), wiec jako
+    najbezpieczniejszy placeholder o poprawnym ksztalcie/rozmiarze uzywamy blobu/ext_id WLASNEJ
+    sesji (own_blob/own_ext_id) zamiast zera/pustego bajtow -- klient i tak juz poprawnie parsuje ten
+    ksztalt (bo to dokladnie to, co sam wyslal w swoim loginie), wiec nie powinien juz czytac poza
+    buforem, nawet jesli tresc semantycznie nie nalezy do szukanej persony."""
+    own_name, own_ext_id, own_blob = own_identity
+    if name == own_name:
+        return name, own_ext_id, own_blob, LOCAL_USER_ID, LOCAL_PERSONA_ID
+    uid = _persona_user_id(name)
+    return name, own_ext_id, own_blob, uid, uid + 1
+
+
+def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
     """Blaze::UserIdentification (9 pol, ksztalt potwierdzony w NotifyUserAdded z realnego ruchu)."""
     name, ext_id, blob = identity
     return [
-        ("AID ", tdf.VARINT, LOCAL_USER_ID),
+        ("AID ", tdf.VARINT, uid),
         ("ALOC", tdf.VARINT, DEFAULT_LOCALE),
         ("EXBB", tdf.BLOB, blob),
         ("EXID", tdf.VARINT, ext_id),
-        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("ID  ", tdf.VARINT, uid),
         ("NAME", tdf.STRING, name),
         ("NASP", tdf.STRING, PERSONA_NAMESPACE),
         ("ORIG", tdf.VARINT, 0),
-        ("PIDI", tdf.VARINT, LOCAL_PERSONA_ID),
+        ("PIDI", tdf.VARINT, persona_id),
     ]
 
 
@@ -182,7 +283,7 @@ def build_user_added(identity) -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
-def build_user_data(identity):
+def build_user_data(identity, uid: int = LOCAL_USER_ID):
     """Blaze::UserManager::UserData -- INNY typ niz UserIdentification. Znaleziony sesja 9 poprzez
     find_tdf_members.py przeszukujac tabele refleksji pod katem pol UserIdentification: zaraz PO tej
     tabeli w EBOOT (0x0254DD4C-0x0254DE04) siedzi OSOBNA tabela pol z dokladnie 6 tagami w tej kolejnosci:
@@ -195,14 +296,15 @@ def build_user_data(identity):
     return [
         ("EXBB", tdf.BLOB, blob),
         ("EXID", tdf.VARINT, ext_id),
-        ("ID  ", tdf.VARINT, LOCAL_USER_ID),
+        ("ID  ", tdf.VARINT, uid),
         ("NAME", tdf.STRING, name),
         ("NASP", tdf.STRING, PERSONA_NAMESPACE),
         ("FLGS", tdf.VARINT, USER_FLAG_ONLINE),
     ]
 
 
-def build_lookup_users_response(component: int, command: int, msg_num: int, identity) -> bytes:
+def build_lookup_users_response(component: int, command: int, msg_num: int, own_identity,
+                                 persona_names) -> bytes:
     """Odpowiedz na UserSessions::lookupUsersByPersonaNames (typ zadania Blaze::LookupUsersByPersonaNamesRequest
     potwierdzony w EBOOT; typ odpowiedzi Blaze::UserDataResponse tez potwierdzony, ale nazwa i ksztalt
     pola-listy przez dlugi czas NIE -- funkcja pod jedynym innym odwolaniem do tablicy pol tylko
@@ -226,17 +328,38 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, iden
     priorytet, bo pochodzi z dzialajacego, potwierdzonego kodu serwera Blaze innej gry EA z tej samej
     rodziny SDK, nie z domyslu.
 
-    Wysylamy ULST jako LIST<UserData> (najwyzszy priorytet -- potwierdzona nazwa pola z Impulsum14 +
-    potwierdzony w EBOOT ksztalt struktury) razem z poprzednimi wariantami pod USER/VALU/DATA/LIST (TDF
-    ignoruje nieznane tagi, wiec to bezpieczne -- klient wezmie to, co rozpozna)."""
-    identity_struct = build_user_identification(identity)
-    user_data_struct = build_user_data(identity)
-    fields = [("ULST", tdf.LIST, (tdf.STRUCT, [user_data_struct]))]
-    fields.append(("USER", tdf.LIST, (tdf.STRUCT, [user_data_struct])))
-    for tag in _LOOKUP_TAG_CANDIDATES:
-        if tag == "USER":
-            continue
-        fields.append((tag, tdf.LIST, (tdf.STRUCT, [identity_struct])))
+    Wysylamy WYLACZNIE ULST jako LIST<UserData> (potwierdzona nazwa pola z Impulsum14 + potwierdzony
+    w EBOOT ksztalt struktury).
+
+    USUNIETO (2026-09-26) shotgun fallback pod tagami USER/VALU/DATA/LIST z UserIdentification --
+    zalozenie "TDF ignoruje nieznane tagi, wiec to bezpieczne" okazalo sie falszywe w multi-gracz
+    scenariuszu: RPCS3 log pokazal deterministyczny PPU access violation na FEThread, zawsze pod
+    TYM SAMYM adresem (0x2ef598, instrukcja `lwz r3,0x90(r31)` -- odczyt pola pod stalym przesunieciem
+    z obiektu, ktorego wskaznik (r31) jest null/zly), niezalezny od tresci EXBB/EXID ktore probowalismy
+    naprawiac wczesniej. Skoro crash jest identyczny przy dwoch roznych tresciach danych, ale WYSTEPUJE
+    dopiero odkad odpowiedz zawiera dane INNEGO gracza (nie tylko wlasna tozsamosc), najbardziej
+    prawdopodobnym podejrzanym staja sie redundantne pola USER/VALU/DATA/LIST -- kod klienta
+    (SDK Blaze/reflection) mogl brac jeden z tych tagow jako sygnal do zupelnie innej sciezki
+    przetwarzania (np. rejestracja obiektu sesji/kontaktu) niz przy odpowiedzi zawierajacej tylko
+    wlasna tozsamosc, i tworzyc/uzywac obiekt z nieprawidlowymi/pustymi polami. README juz potwierdzal
+    ULST jako jedyne zweryfikowane, potrzebne pole -- shotgun byl zabezpieczeniem "na wszelki wypadek"
+    z czasow zanim to potwierdzono, teraz jest tylko zbednym ryzykiem.
+
+    KRYTYCZNA POPRAWKA (multi-gracz, dwie instancje RPCS3 polaczone przez RPCN): wczesniej ta funkcja
+    ZAWSZE zwracala wlasna tozsamosc biezacej sesji (identity) z tym samym sztywnym LOCAL_USER_ID,
+    ignorujac pole PLST z zadania (liste FAKTYCZNIE szukanych nazw person). Gdy gracz A szukal gracza B,
+    dostawal z powrotem dane gracza A pod tym samym BlazeId co jego wlasna sesja -- SDK Blaze wykrywalo
+    sprzecznosc (ten sam BlazeId, inna nazwa niz wlasna) i klient sie rozlaczal ~10-20s po odpowiedzi.
+    Teraz budujemy wpis dla KAZDEJ nazwy z PLST osobno: dla wlasnej nazwy uzywamy prawdziwej tozsamosci
+    (LOCAL_USER_ID), dla kazdej innej -- stabilnego, unikalnego falszywego ID (patrz identity_for_persona/
+    _persona_user_id), zeby uniknac kolizji identyfikatorow miedzy graczami."""
+    if not persona_names:
+        persona_names = [own_identity[0]]
+    user_data_structs = []
+    for name in persona_names:
+        p_name, p_ext_id, p_blob, uid, persona_id = identity_for_persona(name, own_identity)
+        user_data_structs.append(build_user_data((p_name, p_ext_id, p_blob), uid))
+    fields = [("ULST", tdf.LIST, (tdf.STRUCT, user_data_structs))]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -275,11 +398,132 @@ def build_user_updated() -> bytes:
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_UPDATED, payload)
 
 
-def build_ext_data_update() -> bytes:
-    """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001)."""
-    data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
+def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0, best_ping_site: str = "",
+                           dbps: int = 0, ubps: int = 0, natt: int = 0) -> bytes:
+    """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001).
+
+    HIPOTEZA (2026-09-24): wczesniej ADDR bylo UNSET -- klient sam prosi o swoj adres w
+    updateNetworkInfo, ale nigdy nie dostawal odpowiedzi z prawdziwym adresem z powrotem.
+    Teraz wysylamy ADDR jako IpPairAddress (disc=2, tag VALU, ksztalt EXIP/INIP potwierdzony
+    na drucie w zadaniu klienta updateNetworkInfo) z EXIP=INIP=to co klient sam podal jako
+    swoj adres lokalny (jestesmy wszyscy na loopback, wiec 'zewnetrzny' adres = ten sam).
+
+    HIPOTEZA (sesja 4, 2026-09-24): klient w drugim updateNetworkInfo przysyla NLMP (sam
+    zmierzone opoznienie do ping site'ow, np. 'ea-sjc') i NQOS (DBPS/NATT/UBPS, sam wyliczone).
+    UserSessionExtendedData (potwierdzone w Impulsum14) ma pola BPS (BestPingSiteAlias) i QDAT
+    (Util::NetworkQosData {DBPS,NATT,UBPS}), ktorych NIGDY nie wypelnialismy (tylko ADDR).
+    Ekran "laczenie" w grach EA Sports typowo czeka na potwierdzenie od serwera, ktory ping
+    site jest najlepszy (BPS) i jakie jest ostateczne QOS/NAT, zanim zniknie spinner -- wiec
+    odsylamy z powrotem to, co klient sam zmierzyl/wyliczyl, zamiast milczec na te pola."""
+    if ip == 0:
+        ip = _LOOPBACK_IP_U32
+    ip_addr = [("IP  ", tdf.VARINT, ip), ("MACI", tdf.VARINT, maci), ("PORT", tdf.VARINT, port)]
+    ip_pair = [("EXIP", tdf.STRUCT, ip_addr), ("INIP", tdf.STRUCT, ip_addr), ("MACI", tdf.VARINT, maci)]
+    data = [("ADDR", tdf.UNION, (2, ("VALU", tdf.STRUCT, ip_pair)))]
+    if best_ping_site:
+        data.append(("BPS ", tdf.STRING, best_ping_site))
+    qos_data = [("DBPS", tdf.VARINT, dbps), ("NATT", tdf.VARINT, natt), ("UBPS", tdf.VARINT, ubps)]
+    data.append(("QDAT", tdf.STRUCT, qos_data))
     payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
+
+
+def build_ip_address(ip: int, port: int):
+    """Blaze::IpAddress {IP, PORT} -- ksztalt i tagi potwierdzone w Impulsum14 (Blaze/IpAddress.cs),
+    hash tagow zweryfikowany lokalnie (encode_tag('IP  ')<<8 == 0xA7000000, encode_tag('PORT')<<8 ==
+    0xC2FCB400 -- dokladnie te same wartosci co w TdfMemberInfo)."""
+    return [("IP  ", tdf.VARINT, ip), ("PORT", tdf.VARINT, port)]
+
+
+def build_network_address_union(ip: int, port: int):
+    """Blaze::NetworkAddress -- union, disc=2 => IpPairAddress {EXIP, INIP} (oba Blaze::IpAddress),
+    ksztalt potwierdzony w Impulsum14 (NetworkAddress.cs, IpPairAddress.cs). Uzywamy tego samego adresu
+    dla EXIP/INIP jak w build_ext_data_update -- oba klienty siedza w tej samej podsieci Radmin VPN."""
+    addr = build_ip_address(ip, port)
+    ip_pair = [("EXIP", tdf.STRUCT, addr), ("INIP", tdf.STRUCT, addr)]
+    return (2, ("VALU", tdf.STRUCT, ip_pair))
+
+
+def build_replicated_game_player(name: str, identity, uid: int, persona_id: int, game_id: int,
+                                  ip: int, port: int, slot_id: int = 0, team_index: int = 0):
+    """Blaze::GameManager::ReplicatedGamePlayer -- pola/tagi potwierdzone w Impulsum14
+    (GameManager/ReplicatedGamePlayer.cs). PID=PlayerId (BlazeId persony, jak PIDI w
+    build_user_identification), UID=PlayerSessionId (jak AID/ID gdzie indziej) -- to samo
+    rozroznienie uid/persona_id co reszta projektu (identity_for_persona)."""
+    _, ext_id, _blob = identity
+    return [
+        ("EXID", tdf.VARINT, ext_id),
+        ("GID ", tdf.VARINT, game_id),
+        ("NAME", tdf.STRING, name),
+        ("PID ", tdf.VARINT, persona_id),
+        ("PNET", tdf.UNION, build_network_address_union(ip, port)),
+        ("SID ", tdf.VARINT, slot_id),
+        ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
+        ("STAT", tdf.VARINT, 4),          # PlayerState.ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
+        ("TIDX", tdf.VARINT, team_index),
+        ("UID ", tdf.VARINT, uid),
+    ]
+
+
+def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_port: int,
+                                max_players: int, proto_version: str, network_topology: int = 130):
+    """Blaze::GameManager::ReplicatedGameData -- podzbior pol (reszta pomijana, klient dostaje
+    wartosci domyslne dla nieobecnych tagow, jak wszedzie indziej w tym module). Tagi potwierdzone
+    w Impulsum14 (GameManager/ReplicatedGameData.cs). GSTA=PRE_GAME(130) -- gra utworzona, czeka na
+    graczy, zanim przejdzie w IN_GAME(131) (GameState.cs). NTOP domyslnie
+    PEER_TO_PEER_FULL_MESH(130) (GameNetworkTopology.cs) -- echo wartosci klienta gdy podana."""
+    return [
+        ("GID ", tdf.VARINT, game_id),
+        ("GNAM", tdf.STRING, game_name),
+        ("GSET", tdf.VARINT, 0),
+        ("GSTA", tdf.VARINT, 130),
+        ("GTYP", tdf.STRING, "gameType0"),
+        ("HNET", tdf.LIST, (tdf.UNION, [build_network_address_union(host_ip, host_port)])),
+        ("MCAP", tdf.VARINT, max_players),
+        ("NTOP", tdf.VARINT, network_topology),
+        ("VSTR", tdf.STRING, proto_version),
+    ]
+
+
+def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc: int = 0) -> bytes:
+    """NotifyGameSetup {GAME, PROS, QUEU, REAS} (0x0004/0x0014) -- ksztalt potwierdzony w Impulsum14
+    (GameManager/NotifyGameSetup.cs). REAS to unia GameSetupReason (GameSetupReason.cs): disc=0
+    DatalessSetupContext dla gracza ktory sam wywolal createGame, disc=2 IndirectJoinGameSetupContext
+    dla gracza dolaczanego do gry bez wlasnego wywolania createGame/joinGame (patrz komentarz przy
+    obsludze CREATE_GAME_COMMAND) -- oba warianty istnieja w unii, wybor miedzy nimi to decyzja
+    projektowa serwera co do PRZYCZYNY dolaczenia, nie zgadywanie ksztaltu protokolu."""
+    payload = tdf.encode([
+        ("GAME", tdf.STRUCT, game_data_fields),
+        ("PROS", tdf.LIST, (tdf.STRUCT, roster_players)),
+        ("QUEU", tdf.LIST, (tdf.STRUCT, [])),
+        ("REAS", tdf.UNION, (setup_reason_disc, ("VALU", tdf.STRUCT, []))),
+    ])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
+
+
+def build_create_game_response(component: int, command: int, msg_num: int, game_id: int) -> bytes:
+    """CreateGameResponse {GID} -- JEDYNE pole, potwierdzone w Impulsum14 (GameManager/
+    CreateGameResponse.cs: dokladnie jeden czlonek, mGameId/GID, UInt32)."""
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id)])
+    return build_reply(component, command, msg_num, payload)
+
+
+def _find_field(fields, tag):
+    for t, _typ, v in fields:
+        if t == tag:
+            return v
+    return None
+
+
+def _stats_async_fields(group_name: str, view_id: int):
+    stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, []))]
+    return [
+        ("GRNM", tdf.STRING, group_name),
+        ("KEY ", tdf.STRING, ""),
+        ("LAST", tdf.VARINT, 1),
+        ("STS ", tdf.STRUCT, stat_values),
+        ("VID ", tdf.VARINT, view_id),
+    ]
 
 
 def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
@@ -288,16 +532,18 @@ def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
     Klient wysyla getStatsByGroupAsync (0x0007/0x0010) i dostaje na nie PUSTA odpowiedz Reply -- prawdziwe
     dane (tu: pusta lista statystyk, bo nie mamy zadnych realnych danych sezonu) przychodza AS YNC jako ta
     notyfikacja. LAST=1 sygnalizuje klientowi koniec strumienia (brak kolejnych paczek)."""
-    stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, []))]
-    fields = [
-        ("GRNM", tdf.STRING, group_name),
-        ("KEY ", tdf.STRING, ""),
-        ("LAST", tdf.VARINT, 1),
-        ("STS ", tdf.STRUCT, stat_values),
-        ("VID ", tdf.VARINT, view_id),
-    ]
-    payload = tdf.encode(fields)
+    payload = tdf.encode(_stats_async_fields(group_name, view_id))
     return build_notification(STATS_COMPONENT, GET_STATS_ASYNC_NOTIFICATION, payload)
+
+
+def build_stats_by_group_async_reply(component: int, command: int, msg_num: int,
+                                      group_name: str, view_id: int) -> bytes:
+    """EKSPERYMENT (2026-09-26): odpowiedz Reply na getStatsByGroupAsync (0x0007/0x0010) z tymi samymi
+    danymi co GetStatsAsyncNotification, zamiast pustego Reply. Log pokazuje ze klient po dotychczasowej
+    parze (pusty Reply + notification) po prostu milknie i zawiesza sie (baner RE-CONNECT po ~1s) -- test
+    czy oczekuje danych synchronicznie w samym Reply, a nie tylko async w osobnej notyfikacji."""
+    payload = tdf.encode(_stats_async_fields(group_name, view_id))
+    return build_reply(component, command, msg_num, payload)
 
 
 def build_stat_group_response(component: int, command: int, msg_num: int, group_name: str) -> bytes:
@@ -325,6 +571,17 @@ def build_key_scopes_response(component: int, command: int, msg_num: int) -> byt
     KSIT) -- to trzecia komenda w tej samej serii getStatGroup/getKeyScopesMap/getStatsByGroupAsync,
     ktora klient wysyla przy wejsciu w Cup Match/Seasons, wiec tez potrzebuje typowanej odpowiedzi."""
     fields = [("KSIT", tdf.MAP, (tdf.STRING, tdf.STRUCT, []))]
+    payload = tdf.encode(fields)
+    return build_reply(component, command, msg_num, payload)
+
+
+def build_season_id_response(component: int, command: int, msg_num: int, season_id: int = 1) -> bytes:
+    """EKSPERYMENT (2026-09-25): odpowiedz na 0x08C9/0x0001 (przypuszczalnie GetCurrentSeasonId -- patrz
+    komentarz przy SEASONS_COMPONENT, wiazanie NIEPOTWIERDZONE). Wysylamy te sama wartosc pod kilkoma
+    prawdopodobnymi tagami naraz (TDF ignoruje nieznane tagi) zamiast dotychczasowej pustej odpowiedzi,
+    zeby sprawdzic empirycznie czy to odblokuje klienta po "Loading Seasons information...". Jesli nie
+    zadziala, potrzebna dalsza analiza w Ghidrze (zob. README, sekcja o komponencie 0x08C9)."""
+    fields = [(tag, tdf.VARINT, season_id) for tag in _SEASON_ID_TAG_CANDIDATES]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
 
@@ -506,7 +763,18 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
                               canary: bool = False) -> bytes:
     """fetchClientConfig: top-level pole CONF = mapa string->string.
-    Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze."""
+    Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze.
+
+    HIPOTEZA (sesja 5, 2026-09-24): dyzasembler EBOOT pokazal, ze klient przed uruchomieniem
+    watku "FIFA FE Second Initial Thread" (ten sam watek, ktory zapetla sie co ~10s i nigdy
+    nie pozwala przejsc dalej ekranu "PRESS START TO RE-CONNECT") sprawdza flage configu o
+    nazwie "NEW_THREAD_FOR_FE_INIT_STAGE3" (funkcja 0x005C2C1C -> 0x0143D0A0, ktora czyta
+    wartosc po nazwie z domyslna=1/wlaczone, gdy klucza nie ma w configu). Jesli flaga
+    wlaczona -> wchodzi w ta zawieszajaca sie sciezke; jesli wylaczona -> pomija ja calkowicie
+    i idzie inna, starsza sciezka inicjalizacji. Nie wiemy, z ktorego dokladnie CFID klient
+    czyta ten klucz, wiec dodajemy go do WSZYSTKICH odpowiedzi configu (dodatkowy nieznany
+    klucz w mapie string->string jest bezpieczny -- reszta kluczy po prostu jest ignorowana)."""
+    disable_fe_stage3_thread = [("NEW_THREAD_FOR_FE_INIT_STAGE3", "0")]
     if cfid == "IdentityParams":
         redirect = "http://canary-redirect.test/success" if canary else "http://127.0.0.1/success"
         items = [("display", "console2/welcome"), ("redirect_uri", redirect)]
@@ -525,6 +793,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
                  for k in ("nucleusConnect", "nucleusConnectTrusted", "nucleusPortal", "nucleusProxy")]
     else:
         items = []
+    items = items + disable_fe_stage3_thread
     payload = tdf.encode([("CONF", tdf.MAP, (tdf.STRING, tdf.STRING, items))])
     return build_reply(component, command, msg_num, payload)
 
@@ -532,6 +801,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
 def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
     cap = Capture(cfg, "blaze", addr)
     stream = None
+    identity = None                # ustawiane tu tez, zeby finally mial dostep nawet jesli negotiate() rzuci wyjatek
     try:
         stream = negotiate(conn, ctx, cap)
         if stream is None:
@@ -541,6 +811,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
         identity = None            # (nazwa, EXTI, EXTB) z ostatniego login -- do powiadomien o uzytkowniku
         last_stat_group = ""       # NAME z ostatniego Stats::getStatGroup -- getStatsByGroupAsync przychodzi
                                     # z pustym NAME, ale odpowiedz-powiadomienie musi miec prawdziwa nazwe grupy
+        send_lock = threading.Lock()   # chroni WSZYSTKIE zapisy na tym streamie, patrz komentarz przy _PLAYERS
         while True:
             try:
                 chunk = stream.recv(65536)
@@ -605,6 +876,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam LoginResponse [{cfg.login_groups or 'same flagi'}] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                     identity = login_identity(fields)
+                    _register_player(identity[0], stream, send_lock)
                     if cfg.send_user_authenticated:
                         extras.append(("UserAuthenticated [0x7802::0x0008]", build_user_authenticated(identity)))
                     extras.append(("NotifyUserAdded [0x7802::0x0002]", build_user_added(identity)))
@@ -612,16 +884,57 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 elif component == AUTH_COMPONENT and command == GET_ACCOUNT_COMMAND and identity is not None:
                     resp = build_get_account_response(component, command, msg_num, identity)
                     cap.note(f"-> wysylam GetAccountResponse (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                elif component == SEASONS_COMPONENT and command == GET_CURRENT_SEASON_ID_COMMAND:
+                    resp = build_season_id_response(component, command, msg_num)
+                    cap.note(f"-> EKSPERYMENT: wysylam niepusta odpowiedz na 0x08C9/0x0001 "
+                             f"(kilka kandydatow na tag naraz, Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
+                elif component == SEASONS_COMPONENT and command == START_SEASON_COMMAND:
+                    resp = build_reply(component, command, msg_num, b"")
+                    cap.note(f"-> odpowiadam pusto na 0x08C9/0x0002 (msg_num={msg_num}), "
+                             f"prawdopodobnie akcja bez danych zwrotnych")
                 elif component == USER_SESSIONS_COMPONENT and command == UPDATE_NETWORK_INFO_COMMAND:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> odpowiadam pusto na UserSessions::updateNetworkInfo (msg_num={msg_num})")
-                    extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]", build_ext_data_update()))
+                    info_v = _find_field(fields, "INFO") or []
+                    addr_v = _find_field(info_v, "ADDR")
+                    maci = port = ip = 0
+                    if addr_v and addr_v[1] is not None:
+                        _, _, valu_v = addr_v[1]
+                        inip_v = _find_field(valu_v, "INIP") or []
+                        ip = _find_field(inip_v, "IP") or 0
+                        port = _find_field(inip_v, "PORT") or 0
+                        maci = _find_field(valu_v, "MACI") or 0
+                    if identity is not None:
+                        _update_player_network(identity[0], ip, port)
+                    best_ping_site = ""
+                    nlmp_v = _find_field(info_v, "NLMP")
+                    if nlmp_v is not None:
+                        _, _, items = nlmp_v
+                        if items:
+                            best_ping_site = min(items, key=lambda kv: kv[1])[0]
+                    nqos_v = _find_field(info_v, "NQOS") or []
+                    dbps = _find_field(nqos_v, "DBPS") or 0
+                    ubps = _find_field(nqos_v, "UBPS") or 0
+                    natt = _find_field(nqos_v, "NATT") or 0
+                    extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]",
+                                    build_ext_data_update(maci=maci, port=port, best_ping_site=best_ping_site,
+                                                           dbps=dbps, ubps=ubps, natt=natt)))
+                elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
+                      and identity is not None and cfg.lookup_users_empty_reply):
+                    resp = build_reply(component, command, msg_num, b"")
+                    cap.note(f"-> EKSPERYMENT: odpowiadam pusto na lookupUsersByPersonaNames (jak "
+                             f"NIEOBSLUZONE) zeby sprawdzic czy sama obecnosc jakiejkolwiek odpowiedzi "
+                             f"powoduje crash FEThread na drugim kliencie (msg_num={msg_num})")
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
-                    resp = build_lookup_users_response(component, command, msg_num, identity)
-                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames [HIPOTEZA: ULST=LIST<UserData> "
-                             f"(tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS z EBOOT) priorytetowo, "
-                             f"+ USER/VALU/DATA/LIST fallback] (Reply, msg_num={msg_num}), "
+                    plst_v = _find_field(fields, "PLST")
+                    persona_names = list(plst_v[1]) if plst_v else []
+                    resp = build_lookup_users_response(component, command, msg_num, identity, persona_names)
+                    cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames dla {persona_names!r} "
+                             f"[ULST=LIST<UserData> (tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS "
+                             f"z EBOOT), bez shotgun fallback USER/VALU/DATA/LIST -- patrz komentarz przy "
+                             f"build_lookup_users_response] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_STAT_GROUP_COMMAND:
                     group_name = ""
@@ -643,29 +956,100 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             group_name = v
                         elif tag == "VID":
                             view_id = v
-                    resp = build_reply(component, command, msg_num, b"")
-                    cap.note(f"-> odpowiadam pusto na Stats::getStatsByGroupAsync (msg_num={msg_num}), "
-                             f"grupa={group_name!r} (z ostatniego getStatGroup)")
+                    resp = build_stats_by_group_async_reply(component, command, msg_num, group_name, view_id)
+                    cap.note(f"-> EKSPERYMENT: odpowiadam na Stats::getStatsByGroupAsync danymi w Reply "
+                             f"(nie pusto, msg_num={msg_num}), grupa={group_name!r} "
+                             f"(z ostatniego getStatGroup), {len(resp)-HDR_LEN}B payloadu")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
                                     build_stats_async_notification(group_name, view_id)))
+                elif (component == GAME_MANAGER_COMPONENT and command == CREATE_GAME_COMMAND
+                      and identity is not None):
+                    # GameManager::createGame -- KLIENT WYSYLA TO PO KLIKNIECIU "Play Match", SERWER
+                    # DOTAD ODPOWIADAL PUSTO (fallback ponizej), stad zawieszenie na "Sending match
+                    # invite and creating a game session". Realny ksztalt zadania FIFA17 (potwierdzony
+                    # na drucie, sesja 2026-09-26) rozni sie od CreateGameRequest.cs z Impulsum14:
+                    # klient opakowuje dane w CMGD {GGTY,GVER,OSID,PNET,XNET} i GMCD {ATTR,CRIT,GNAM,
+                    # GSET,NTOP,PMAX,PMIN,PRES,QCAP,...} zamiast pol plaskich na najwyzszym poziomie --
+                    # GNAM/PMAX/NTOP sa WEWNATRZ GMCD, GVER (nie VSTR) jest wewnatrz CMGD. PLJD.PLDL
+                    # zawiera TYLKO wlasny wpis gracza-tworcy (USID.NAME='odyniec' w przechwycie), NIE
+                    # tozsamosc zapraszanego -- ten kto ma zostac zaproszony nie jest w tym zadaniu wcale,
+                    # wiec budujemy to z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie dwoch
+                    # graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
+                    # zalogowanego gracza -- to decyzja logiki serwera, nie zalozenie co do protokolu.
+                    host_name = identity[0]
+                    gmcd_v = _find_field(fields, "GMCD") or []
+                    cmgd_v = _find_field(fields, "CMGD") or []
+                    game_name = _find_field(gmcd_v, "GNAM") or f"{host_name}'s game"
+                    proto_version = _find_field(cmgd_v, "GVER") or ""
+                    max_players = _find_field(gmcd_v, "PMAX") or 2
+
+                    with _GAMES_LOCK:
+                        game_id = _next_game_id[0]
+                        _next_game_id[0] += 1
+
+                    with _PLAYERS_LOCK:
+                        host_info = _PLAYERS.get(host_name, {})
+                        other_names = [n for n in _PLAYERS if n != host_name]
+                    host_ip, host_port = host_info.get("ip", 0), host_info.get("port", 0)
+
+                    resp = build_create_game_response(component, command, msg_num, game_id)
+                    cap.note(f"-> wysylam CreateGameResponse GID={game_id} dla {host_name!r} "
+                             f"(Reply, msg_num={msg_num})")
+
+                    roster = [build_replicated_game_player(host_name, identity, LOCAL_USER_ID,
+                                                            LOCAL_PERSONA_ID, game_id, host_ip, host_port,
+                                                            slot_id=0, team_index=0)]
+                    invited = []
+                    for other_name in other_names:
+                        other_p_name, other_ext_id, other_blob, other_uid, other_persona_id = \
+                            identity_for_persona(other_name, identity)
+                        with _PLAYERS_LOCK:
+                            other_info = _PLAYERS.get(other_name, {})
+                        other_ip, other_port = other_info.get("ip", 0), other_info.get("port", 0)
+                        roster.append(build_replicated_game_player(
+                            other_p_name, (other_p_name, other_ext_id, other_blob), other_uid,
+                            other_persona_id, game_id, other_ip, other_port,
+                            slot_id=len(roster), team_index=1))
+                        invited.append(other_name)
+
+                    network_topology = _find_field(gmcd_v, "NTOP") or 130
+                    game_data = build_replicated_game_data(game_id, game_name, host_ip, host_port,
+                                                            max_players, proto_version, network_topology)
+                    extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)",
+                                    build_notify_game_setup(game_data, roster, setup_reason_disc=0)))
+                    if invited:
+                        for other_name in invited:
+                            frame = build_notify_game_setup(game_data, roster, setup_reason_disc=2)
+                            if not _send_frame(other_name, frame, cap,
+                                               "NotifyGameSetup [0x0004::0x0014] "
+                                               "(zaproszony, IndirectJoinGameSetupContext)"):
+                                cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {other_name!r} "
+                                         f"(rozlaczony?)")
+                    else:
+                        cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
                              f"wysylam pusta odpowiedz Reply (msg_num={msg_num})")
 
-                if resp is not None:
-                    cap.data("S->C", resp)
-                    stream.sendall(resp)
-                for label, frame in extras:
-                    cap.note(f"-> wysylam powiadomienie {label}, {len(frame)-HDR_LEN}B payloadu")
-                    cap.data("S->C", frame)
-                    stream.sendall(frame)
+                with send_lock:
+                    if resp is not None:
+                        cap.data("S->C", resp)
+                        stream.sendall(resp)
+                    for label, frame in extras:
+                        cap.note(f"-> wysylam powiadomienie {label}, {len(frame)-HDR_LEN}B payloadu")
+                        cap.data("S->C", frame)
+                        stream.sendall(frame)
 
     except (ssl.SSLError, OSError) as exc:
         cap.note(f"connection error: {exc}")
     finally:
         try:
-            if stream is not None:
-                stream.close()
+            if identity is not None:
+                _unregister_player(identity[0])
         finally:
-            cap.close()
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                cap.close()

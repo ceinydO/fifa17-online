@@ -61,6 +61,16 @@ class Config:
     # czasu: gdy logout zmienia moment, wiadomo, ktory z nich go wywoluje.
     conf_request_timeout: str = "20s"
     conf_idle_timeout: str = "40s"
+    # Eksperyment diagnostyczny (2026-09-26): drugi klient (RPCS3 #2, konto RPCN "reinoldo")
+    # crashuje deterministycznie (PPU access violation, FEThread, offset 0x90 od null-wskaznika)
+    # jakis czas po odpowiedzi na lookupUsersByPersonaNames -- ta odpowiedz idzie automatycznie
+    # przy kazdym starcie (klient sam dopytuje o ostatnio widzianego gracza), wiec nie da sie tego
+    # ominac z poziomu UI. Tresc odpowiedzi zmienialismy trzykrotnie (puste pola / kopia wlasnego
+    # EXTB-EXID / usuniecie shotgun fallbacku) bez ZADNEGO wplywu na crash -- zawsze ten sam adres.
+    # Ta flaga pozwala sprawdzic OSTATNIA rzecz w naszej kontroli: czy sama OBECNOSC jakiejkolwiek
+    # odpowiedzi (zamiast calkowitego jej braku, jak inne nieobslugiwane komendy) jest wyzwalaczem.
+    # True = odpowiadamy pusto (jak NIEOBSLUZONE), tak jakbysmy w ogole nie mieli handlera.
+    lookup_users_empty_reply: bool = False
 
     @property
     def cert_dir_path(self) -> Path:

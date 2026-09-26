@@ -54,10 +54,14 @@ def _firewall_xml() -> str:
 
 
 def _firetype_xml() -> str:
+    """firetype=0 -- HIPOTEZA: 0=Open w typowym oznaczeniu EA/DirtySDK (0=Open, 1=Moderate,
+    2=Strict). Bylo 2 (Strict); klient moze na tej podstawie uznawac, ze P2P jest niemozliwe
+    i nigdy nie probowac GameManager::createGame/joinGame -- co pasuje do obserwacji: po
+    Stats i drugim updateNetworkInfo klient milknie i pokazuje "PRESS START TO RE-CONNECT"."""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         "<firetype>\n"
-        "    <firetype>2</firetype>\n"
+        "    <firetype>0</firetype>\n"
         "</firetype>\n"
     )
 
