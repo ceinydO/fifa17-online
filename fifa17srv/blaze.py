@@ -190,12 +190,25 @@ def _persona_user_id(name: str) -> int:
 def identity_for_persona(name: str, own_identity):
     """Zwraca (nazwa, ext_id, blob, uid, persona_id) dla podanej nazwy persony -- jesli to wlasna
     tozsamosc biezacej sesji, uzywa prawdziwych LOCAL_USER_ID/LOCAL_PERSONA_ID i EXTI/EXTB z loginu;
-    w przeciwnym razie generuje spojny, unikalny falszywy identyfikator (patrz _persona_user_id)."""
+    w przeciwnym razie generuje spojny, unikalny falszywy identyfikator (patrz _persona_user_id).
+
+    UWAGA (crash po poprawce kolizji BlazeId): pierwsza wersja zwracala tu ext_id=0, blob=b"" dla
+    kazdej persony innej niz wlasna. To odblokowalo dawny problem (kolizja BlazeId -> rozlaczenie),
+    ale ujawnilo NOWY: PPU access violation na FEThread (czytanie adresu 0x90 -- niski, stale
+    przesuniecie typowe dla odczytu pola ze struktury spod pustego/null wskaznika). EXBB (EXTB z
+    loginu) to najwyrazniej struktura o ustalonym ksztalcie (np. NpId), ktora klient parsuje zakladajac
+    minimalny rozmiar; pusty blob (0 bajtow) daje wskaznik null/za krotki bufor, wiec odczyt pola w
+    stalym przesunieciu (tu akurat 0x90) pada. Serwer nie zna PRAWDZIWEGO EXTB/EXTI drugiego gracza
+    (kazde polaczenie jest obslugiwane osobno, bez wspoldzielonego stanu sesji), wiec jako
+    najbezpieczniejszy placeholder o poprawnym ksztalcie/rozmiarze uzywamy blobu/ext_id WLASNEJ
+    sesji (own_blob/own_ext_id) zamiast zera/pustego bajtow -- klient i tak juz poprawnie parsuje ten
+    ksztalt (bo to dokladnie to, co sam wyslal w swoim loginie), wiec nie powinien juz czytac poza
+    buforem, nawet jesli tresc semantycznie nie nalezy do szukanej persony."""
     own_name, own_ext_id, own_blob = own_identity
     if name == own_name:
         return name, own_ext_id, own_blob, LOCAL_USER_ID, LOCAL_PERSONA_ID
     uid = _persona_user_id(name)
-    return name, 0, b"", uid, uid + 1
+    return name, own_ext_id, own_blob, uid, uid + 1
 
 
 def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
