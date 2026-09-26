@@ -780,6 +780,12 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                     build_ext_data_update(maci=maci, port=port, best_ping_site=best_ping_site,
                                                            dbps=dbps, ubps=ubps, natt=natt)))
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
+                      and identity is not None and cfg.lookup_users_empty_reply):
+                    resp = build_reply(component, command, msg_num, b"")
+                    cap.note(f"-> EKSPERYMENT: odpowiadam pusto na lookupUsersByPersonaNames (jak "
+                             f"NIEOBSLUZONE) zeby sprawdzic czy sama obecnosc jakiejkolwiek odpowiedzi "
+                             f"powoduje crash FEThread na drugim kliencie (msg_num={msg_num})")
+                elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None):
                     plst_v = _find_field(fields, "PLST")
                     persona_names = list(plst_v[1]) if plst_v else []
