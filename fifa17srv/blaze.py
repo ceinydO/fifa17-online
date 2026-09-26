@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import socket
 import ssl
+import threading
 import time
 
 from . import tdf
@@ -95,6 +96,60 @@ SEASONS_COMPONENT = 0x08C9
 GET_CURRENT_SEASON_ID_COMMAND = 0x0001
 START_SEASON_COMMAND = 0x0002
 _SEASON_ID_TAG_CANDIDATES = ("SEAS", "SNUM", "SIID", "CSID", "ID  ", "STAT")
+
+# Blaze::GameManager -- komponent 0x0004, potwierdzony w Impulsum14 (Components/GameManagerBase.json,
+# "Id": 4) I na drucie (realny przechwyt: klient po ekranie "Play Match" wysyla component=0x0004
+# command=0x0001, ktore u nas wpadalo w ogolny fallback i dostawalo pusta odpowiedz -- stad zawieszenie
+# na "Sending match invite and creating a game session"). createGame = method Id 1 (CreateGameRequest/
+# CreateGameResponse), NotifyGameSetup = notification Id 20 (0x14) -- oba potwierdzone w tym samym pliku.
+GAME_MANAGER_COMPONENT = 0x0004
+CREATE_GAME_COMMAND = 0x0001
+NOTIFY_GAME_SETUP = 0x0014
+
+# Rejestr polaczonych graczy (nazwa persony -> stream/lock/adres), potrzebny zeby createGame wywolane
+# w watku jednego gracza moglo wypchnac powiadomienie NotifyGameSetup do watku DRUGIEGO gracza --
+# do tej pory kazde polaczenie bylo obslugiwane w calkowitej izolacji (zmienna `identity` byla lokalna
+# dla handle()). send_lock chroni WSZYSTKIE zapisy na danym streamie (wlasne odpowiedzi tego polaczenia
+# ORAZ asynchroniczne powiadomienia wpychane z watku innego gracza), zeby ramki nigdy sie nie przeplotly.
+_PLAYERS_LOCK = threading.Lock()
+_PLAYERS: dict = {}   # nazwa persony -> {"stream", "send_lock", "ip", "port"}
+_GAMES_LOCK = threading.Lock()
+_next_game_id = [1]
+
+
+def _register_player(name: str, stream, send_lock: threading.Lock) -> None:
+    with _PLAYERS_LOCK:
+        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0}
+
+
+def _unregister_player(name: str) -> None:
+    with _PLAYERS_LOCK:
+        _PLAYERS.pop(name, None)
+
+
+def _update_player_network(name: str, ip: int, port: int) -> None:
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+        if entry is not None:
+            entry["ip"], entry["port"] = ip, port
+
+
+def _send_frame(name: str, frame: bytes, cap: Capture, label: str) -> bool:
+    """Wypycha ramke (powiadomienie) do INNEGO gracza, z dowolnego watku."""
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+    if entry is None:
+        return False
+    try:
+        with entry["send_lock"]:
+            entry["stream"].sendall(frame)
+        cap.data("S->C", frame)
+        cap.note(f"-> wysylam {label} do {name!r}, {len(frame)-HDR_LEN}B payloadu")
+        return True
+    except OSError as exc:
+        cap.note(f"-> blad wysylki {label} do {name!r}: {exc}")
+        return False
+
 
 PERSONA_NAMESPACE = "cem_ea_id"
 DEFAULT_LOCALE = 1701724754        # 'enBR' -- taka wartosc klient wyslal w LANG w PreAuth
@@ -371,6 +426,86 @@ def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0, best_ping_s
     data.append(("QDAT", tdf.STRUCT, qos_data))
     payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
+
+
+def build_ip_address(ip: int, port: int):
+    """Blaze::IpAddress {IP, PORT} -- ksztalt i tagi potwierdzone w Impulsum14 (Blaze/IpAddress.cs),
+    hash tagow zweryfikowany lokalnie (encode_tag('IP  ')<<8 == 0xA7000000, encode_tag('PORT')<<8 ==
+    0xC2FCB400 -- dokladnie te same wartosci co w TdfMemberInfo)."""
+    return [("IP  ", tdf.VARINT, ip), ("PORT", tdf.VARINT, port)]
+
+
+def build_network_address_union(ip: int, port: int):
+    """Blaze::NetworkAddress -- union, disc=2 => IpPairAddress {EXIP, INIP} (oba Blaze::IpAddress),
+    ksztalt potwierdzony w Impulsum14 (NetworkAddress.cs, IpPairAddress.cs). Uzywamy tego samego adresu
+    dla EXIP/INIP jak w build_ext_data_update -- oba klienty siedza w tej samej podsieci Radmin VPN."""
+    addr = build_ip_address(ip, port)
+    ip_pair = [("EXIP", tdf.STRUCT, addr), ("INIP", tdf.STRUCT, addr)]
+    return (2, ("VALU", tdf.STRUCT, ip_pair))
+
+
+def build_replicated_game_player(name: str, identity, uid: int, persona_id: int, game_id: int,
+                                  ip: int, port: int, slot_id: int = 0, team_index: int = 0):
+    """Blaze::GameManager::ReplicatedGamePlayer -- pola/tagi potwierdzone w Impulsum14
+    (GameManager/ReplicatedGamePlayer.cs). PID=PlayerId (BlazeId persony, jak PIDI w
+    build_user_identification), UID=PlayerSessionId (jak AID/ID gdzie indziej) -- to samo
+    rozroznienie uid/persona_id co reszta projektu (identity_for_persona)."""
+    _, ext_id, _blob = identity
+    return [
+        ("EXID", tdf.VARINT, ext_id),
+        ("GID ", tdf.VARINT, game_id),
+        ("NAME", tdf.STRING, name),
+        ("PID ", tdf.VARINT, persona_id),
+        ("PNET", tdf.UNION, build_network_address_union(ip, port)),
+        ("SID ", tdf.VARINT, slot_id),
+        ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
+        ("STAT", tdf.VARINT, 4),          # PlayerState.ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
+        ("TIDX", tdf.VARINT, team_index),
+        ("UID ", tdf.VARINT, uid),
+    ]
+
+
+def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_port: int,
+                                max_players: int, proto_version: str, network_topology: int = 130):
+    """Blaze::GameManager::ReplicatedGameData -- podzbior pol (reszta pomijana, klient dostaje
+    wartosci domyslne dla nieobecnych tagow, jak wszedzie indziej w tym module). Tagi potwierdzone
+    w Impulsum14 (GameManager/ReplicatedGameData.cs). GSTA=PRE_GAME(130) -- gra utworzona, czeka na
+    graczy, zanim przejdzie w IN_GAME(131) (GameState.cs). NTOP domyslnie
+    PEER_TO_PEER_FULL_MESH(130) (GameNetworkTopology.cs) -- echo wartosci klienta gdy podana."""
+    return [
+        ("GID ", tdf.VARINT, game_id),
+        ("GNAM", tdf.STRING, game_name),
+        ("GSET", tdf.VARINT, 0),
+        ("GSTA", tdf.VARINT, 130),
+        ("GTYP", tdf.STRING, "gameType0"),
+        ("HNET", tdf.LIST, (tdf.UNION, [build_network_address_union(host_ip, host_port)])),
+        ("MCAP", tdf.VARINT, max_players),
+        ("NTOP", tdf.VARINT, network_topology),
+        ("VSTR", tdf.STRING, proto_version),
+    ]
+
+
+def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc: int = 0) -> bytes:
+    """NotifyGameSetup {GAME, PROS, QUEU, REAS} (0x0004/0x0014) -- ksztalt potwierdzony w Impulsum14
+    (GameManager/NotifyGameSetup.cs). REAS to unia GameSetupReason (GameSetupReason.cs): disc=0
+    DatalessSetupContext dla gracza ktory sam wywolal createGame, disc=2 IndirectJoinGameSetupContext
+    dla gracza dolaczanego do gry bez wlasnego wywolania createGame/joinGame (patrz komentarz przy
+    obsludze CREATE_GAME_COMMAND) -- oba warianty istnieja w unii, wybor miedzy nimi to decyzja
+    projektowa serwera co do PRZYCZYNY dolaczenia, nie zgadywanie ksztaltu protokolu."""
+    payload = tdf.encode([
+        ("GAME", tdf.STRUCT, game_data_fields),
+        ("PROS", tdf.LIST, (tdf.STRUCT, roster_players)),
+        ("QUEU", tdf.LIST, (tdf.STRUCT, [])),
+        ("REAS", tdf.UNION, (setup_reason_disc, ("VALU", tdf.STRUCT, []))),
+    ])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
+
+
+def build_create_game_response(component: int, command: int, msg_num: int, game_id: int) -> bytes:
+    """CreateGameResponse {GID} -- JEDYNE pole, potwierdzone w Impulsum14 (GameManager/
+    CreateGameResponse.cs: dokladnie jeden czlonek, mGameId/GID, UInt32)."""
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id)])
+    return build_reply(component, command, msg_num, payload)
 
 
 def _find_field(fields, tag):
@@ -666,6 +801,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
 def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
     cap = Capture(cfg, "blaze", addr)
     stream = None
+    identity = None                # ustawiane tu tez, zeby finally mial dostep nawet jesli negotiate() rzuci wyjatek
     try:
         stream = negotiate(conn, ctx, cap)
         if stream is None:
@@ -675,6 +811,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
         identity = None            # (nazwa, EXTI, EXTB) z ostatniego login -- do powiadomien o uzytkowniku
         last_stat_group = ""       # NAME z ostatniego Stats::getStatGroup -- getStatsByGroupAsync przychodzi
                                     # z pustym NAME, ale odpowiedz-powiadomienie musi miec prawdziwa nazwe grupy
+        send_lock = threading.Lock()   # chroni WSZYSTKIE zapisy na tym streamie, patrz komentarz przy _PLAYERS
         while True:
             try:
                 chunk = stream.recv(65536)
@@ -739,6 +876,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam LoginResponse [{cfg.login_groups or 'same flagi'}] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                     identity = login_identity(fields)
+                    _register_player(identity[0], stream, send_lock)
                     if cfg.send_user_authenticated:
                         extras.append(("UserAuthenticated [0x7802::0x0008]", build_user_authenticated(identity)))
                     extras.append(("NotifyUserAdded [0x7802::0x0002]", build_user_added(identity)))
@@ -760,12 +898,15 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> odpowiadam pusto na UserSessions::updateNetworkInfo (msg_num={msg_num})")
                     info_v = _find_field(fields, "INFO") or []
                     addr_v = _find_field(info_v, "ADDR")
-                    maci = port = 0
+                    maci = port = ip = 0
                     if addr_v and addr_v[1] is not None:
                         _, _, valu_v = addr_v[1]
                         inip_v = _find_field(valu_v, "INIP") or []
+                        ip = _find_field(inip_v, "IP") or 0
                         port = _find_field(inip_v, "PORT") or 0
                         maci = _find_field(valu_v, "MACI") or 0
+                    if identity is not None:
+                        _update_player_network(identity[0], ip, port)
                     best_ping_site = ""
                     nlmp_v = _find_field(info_v, "NLMP")
                     if nlmp_v is not None:
@@ -821,24 +962,88 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(z ostatniego getStatGroup), {len(resp)-HDR_LEN}B payloadu")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
                                     build_stats_async_notification(group_name, view_id)))
+                elif (component == GAME_MANAGER_COMPONENT and command == CREATE_GAME_COMMAND
+                      and identity is not None):
+                    # GameManager::createGame -- KLIENT WYSYLA TO PO KLIKNIECIU "Play Match", SERWER
+                    # DOTAD ODPOWIADAL PUSTO (fallback ponizej), stad zawieszenie na "Sending match
+                    # invite and creating a game session". CreateGameRequest.cs z Impulsum14 NIE
+                    # zawiera pol PNET/XNET/PLJD widocznych w realnym przechwycie (prawdopodobnie
+                    # roznica wersji SDK FIFA17 vs FIFA14 PC) -- zamiast zgadywac ich ksztalt, czytamy
+                    # tylko pola KTORE potwierdzone istnieja w obu (GNAM/VSTR/PMAX) i budujemy reszte
+                    # (kto jest zapraszany) z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie
+                    # dwoch graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
+                    # zalogowanego gracza -- to decyzja logiki serwera, nie zalozenie co do protokolu.
+                    host_name = identity[0]
+                    game_name = _find_field(fields, "GNAM") or f"{host_name}'s game"
+                    proto_version = _find_field(fields, "VSTR") or ""
+                    max_players = _find_field(fields, "PMAX") or 2
+
+                    with _GAMES_LOCK:
+                        game_id = _next_game_id[0]
+                        _next_game_id[0] += 1
+
+                    with _PLAYERS_LOCK:
+                        host_info = _PLAYERS.get(host_name, {})
+                        other_names = [n for n in _PLAYERS if n != host_name]
+                    host_ip, host_port = host_info.get("ip", 0), host_info.get("port", 0)
+
+                    resp = build_create_game_response(component, command, msg_num, game_id)
+                    cap.note(f"-> wysylam CreateGameResponse GID={game_id} dla {host_name!r} "
+                             f"(Reply, msg_num={msg_num})")
+
+                    roster = [build_replicated_game_player(host_name, identity, LOCAL_USER_ID,
+                                                            LOCAL_PERSONA_ID, game_id, host_ip, host_port,
+                                                            slot_id=0, team_index=0)]
+                    invited = []
+                    for other_name in other_names:
+                        other_p_name, other_ext_id, other_blob, other_uid, other_persona_id = \
+                            identity_for_persona(other_name, identity)
+                        with _PLAYERS_LOCK:
+                            other_info = _PLAYERS.get(other_name, {})
+                        other_ip, other_port = other_info.get("ip", 0), other_info.get("port", 0)
+                        roster.append(build_replicated_game_player(
+                            other_p_name, (other_p_name, other_ext_id, other_blob), other_uid,
+                            other_persona_id, game_id, other_ip, other_port,
+                            slot_id=len(roster), team_index=1))
+                        invited.append(other_name)
+
+                    game_data = build_replicated_game_data(game_id, game_name, host_ip, host_port,
+                                                            max_players, proto_version)
+                    extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)",
+                                    build_notify_game_setup(game_data, roster, setup_reason_disc=0)))
+                    if invited:
+                        for other_name in invited:
+                            frame = build_notify_game_setup(game_data, roster, setup_reason_disc=2)
+                            if not _send_frame(other_name, frame, cap,
+                                               "NotifyGameSetup [0x0004::0x0014] "
+                                               "(zaproszony, IndirectJoinGameSetupContext)"):
+                                cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {other_name!r} "
+                                         f"(rozlaczony?)")
+                    else:
+                        cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
                              f"wysylam pusta odpowiedz Reply (msg_num={msg_num})")
 
-                if resp is not None:
-                    cap.data("S->C", resp)
-                    stream.sendall(resp)
-                for label, frame in extras:
-                    cap.note(f"-> wysylam powiadomienie {label}, {len(frame)-HDR_LEN}B payloadu")
-                    cap.data("S->C", frame)
-                    stream.sendall(frame)
+                with send_lock:
+                    if resp is not None:
+                        cap.data("S->C", resp)
+                        stream.sendall(resp)
+                    for label, frame in extras:
+                        cap.note(f"-> wysylam powiadomienie {label}, {len(frame)-HDR_LEN}B payloadu")
+                        cap.data("S->C", frame)
+                        stream.sendall(frame)
 
     except (ssl.SSLError, OSError) as exc:
         cap.note(f"connection error: {exc}")
     finally:
         try:
-            if stream is not None:
-                stream.close()
+            if identity is not None:
+                _unregister_player(identity[0])
         finally:
-            cap.close()
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                cap.close()
