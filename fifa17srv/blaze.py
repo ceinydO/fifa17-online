@@ -761,7 +761,7 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
 
 
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
-                              canary: bool = False) -> bytes:
+                              canary: bool = False, advertise_host: str = "127.0.0.1") -> bytes:
     """fetchClientConfig: top-level pole CONF = mapa string->string.
     Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze.
 
@@ -776,7 +776,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
     klucz w mapie string->string jest bezpieczny -- reszta kluczy po prostu jest ignorowana)."""
     disable_fe_stage3_thread = [("NEW_THREAD_FOR_FE_INIT_STAGE3", "0")]
     if cfid == "IdentityParams":
-        redirect = "http://canary-redirect.test/success" if canary else "http://127.0.0.1/success"
+        redirect = "http://canary-redirect.test/success" if canary else f"http://{advertise_host}/success"
         items = [("display", "console2/welcome"), ("redirect_uri", redirect)]
         if canary:
             # Diagnostyka: w EBOOT klucz "nucleusConnect" stoi tuz przy szablonie
@@ -869,7 +869,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     for tag, t, v in fields:
                         if tag == "CFID":
                             cfid = v
-                    resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts)
+                    resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts,
+                                                      cfg.blaze_advertise_host)
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")
                 elif component == AUTH_COMPONENT and command == LOGIN_COMMAND:
                     resp = build_login_response(component, command, msg_num, fields, cfg.login_groups)
