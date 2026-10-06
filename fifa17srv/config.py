@@ -61,7 +61,7 @@ class Config:
     # czasu: gdy logout zmienia moment, wiadomo, ktory z nich go wywoluje.
     conf_request_timeout: str = "20s"
     conf_idle_timeout: str = "40s"
-    # Eksperyment diagnostyczny (2026-09-26): drugi klient (RPCS3 #2, konto RPCN "reinoldo")
+    # Eksperyment diagnostyczny (2026-09-26): drugi klient (RPCS3 #2, konto RPCN "playerB")
     # crashuje deterministycznie (PPU access violation, FEThread, offset 0x90 od null-wskaznika)
     # jakis czas po odpowiedzi na lookupUsersByPersonaNames -- ta odpowiedz idzie automatycznie
     # przy kazdym starcie (klient sam dopytuje o ostatnio widzianego gracza), wiec nie da sie tego

@@ -15,7 +15,7 @@ game itself.
 > source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
 > session (human or Claude) does not have to re-derive it from scratch.
 
-## Current status (as of 2026-09-26)
+## Current status (as of 2026-09-28)
 
 The full PS3 client login handshake **works end-to-end**: redirector → TLS → PreAuth → Ping →
 fetchClientConfig → fake Nucleus OAuth → Blaze login → account/session notifications → main Online
@@ -209,11 +209,66 @@ except possibly the current blocker.
     `UserAuthenticated` (`0x0008`), `NotifyUserAdded` (`0x0002`), `UserUpdated` (`0x0005`),
     `UserSessionExtendedDataUpdate` (`0x0001`).
 
+## Playing with a second player (setup guide, verified 2026-09-28)
+
+Everything below was needed to get two real RPCS3 instances on two physical PCs (connected over a
+VPN such as Radmin) to both log in to one `fifa17srv` instance. `<HOST_VPN_IP>` is the VPN address
+of the machine running the server.
+
+**Host:** `config.json` with `{"bind_address": "0.0.0.0", "blaze_advertise_host": "<HOST_VPN_IP>"}`,
+then `update_and_run.ps1`. Only the host runs the server.
+
+**Every client (including the host):**
+1. **RPCS3 → right-click game → Configuration → Network → "IP/Hosts switches"** must map the three
+   EA hostnames. This field is RPCS3's own resolver and **takes precedence over the Windows hosts
+   file**. A stale `winter15.gosredirector.ea.com=127.0.0.1` here silently sends the client to
+   itself. On the second player it must look like:
+   `winter15.gosredirector.ea.com=<HOST_VPN_IP>&&rl.data.ea.com=<HOST_VPN_IP>&&pin-river.data.ea.com=<HOST_VPN_IP>`
+2. **Nucleus OAuth is hard-wired to `127.0.0.1:8081`.** The client opens that connection with no DNS
+   lookup at all (confirmed in RPCS3.log: no `DnsHook` line, direct `Attempting to connect on
+   127.0.0.1:8081`), and changing the `redirect_uri` we send in the `IdentityParams` config does not
+   change it. On any machine that is **not** the host the connection is refused, the client never
+   reaches our fake Nucleus, never sends the login request, and ends up on the "EA servers are not
+   available" screen. Fix on the second player (admin PowerShell):
+   `netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8081 connectaddress=<HOST_VPN_IP> connectport=8081`
+   (undo with `netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=8081`).
+3. Restart the game after changing any of this. RPCN sign-in in RPCS3 is separate from all of the
+   above and goes over the normal internet, not the VPN.
+
+**Debugging tip:** the per-connection capture files in `logs/captures/` and RPCS3's own
+`RPCS3.log` are both needed; the combined console output interleaves lines from concurrent
+connections (an apparent "S->C 21 bytes" after an invite was just another connection's write).
+
+## Status after two-player testing (2026-09-28) — where this project stopped
+
+**Works with two real players:** redirector, PreAuth, fake Nucleus, login, user/session
+notifications, Stats group burst, and `GameManager::createGame` — both players' `createGame`
+requests are parsed and answered, and `NotifyGameSetup` is written to the other player's live TCP
+connection without error.
+
+**Does not work:** the invited player never sees the invite and the host stays on "Sending match
+invite and creating a game session. Please wait...". Both clients also show the red "PRESS THE START
+BUTTON TO RE-CONNECT" banner and **repeatedly perform full reconnects (redirector → login from
+scratch) every ~50–90 s** — in the server captures and in the client's RPCS3.log (`bind 0.0.0.0:3659`,
+`ECONNRESET`/`ENOTCONN`, `sceNpLookupInit`/`Term` cycles). This is most likely the same unresolved
+client-side watchdog described under "Current blocker" and probably explains the lost invite.
+Two hypotheses were left untested: (1) a fixed client-side timer unrelated to user actions
+(→ needs more Ghidra/live-debugger work, see `0xA46528`/`0xA465D8`), (2) a reconnect triggered by
+pressing "Play Match", in which case the invite may go to a stale entry in the `_PLAYERS` registry —
+the cheap discriminating test is two logged-in players idling 2 minutes without pressing anything.
+
+Note on command IDs: Impulsum14's component/command numbering (FIFA 14 / older Blaze) does **not**
+match FIFA 17 (e.g. Authentication login is `0x000A` on the wire, not `0x28`), so unknown commands
+such as `0x0001/0x0046` cannot be named from it.
+
+Contributions and pointers are welcome, in particular from anyone who has traced the client's
+reconnect state machine or knows the FIFA 17 / Blaze 15.1 command tables.
+
 ## Online Friendlies: GameManager `createGame` (2026-09-26)
 
 **Setup used for this testing:** the user has a friend with their own physical PC and their own
 legitimate FIFA 17 disc/ISO. Both machines run RPCS3 and connect over **Radmin VPN** (already
-installed, host VPN IP `26.76.101.213`) instead of a VM — an earlier attempt to run two RPCS3
+installed; host VPN IP written below as `<HOST_VPN_IP>`) instead of a VM — an earlier attempt to run two RPCS3
 instances on one machine inside a VirtualBox VM was abandoned after VirtualBox's virtual GPU could
 not create the OpenGL context RPCS3 needs (`Failed to create OpenGL context`, then a full VM freeze
 even with 3D Acceleration + `VBoxSVGA` enabled). Both players' clients connect to the **same**
@@ -766,12 +821,10 @@ Play Season test shows:
 
 The PS3 EBOOT.ELF static-analysis scripts (`find_str_refs.py`, `find_cmd_consts.py`,
 `find_cmd_names.py`, `find_requests.py`, `disasm_range.py`, `dump_words.py`,
-`find_tdf_members.py`, `find_callers.py`, ...) used to derive the confirmed facts above **are not
-part of this git repository** — they live only on the Windows machine where the actual RE work
-happens, alongside the (not-redistributed) EBOOT.ELF itself. If starting a fresh session without
-that context, ask the user to run the relevant tool and paste its output rather than assuming the
-tools are available locally; each tool prints its own usage/docstring on `--help` or bad args,
-which is more reliable than remembering exact flags from a previous session.
+`find_tdf_members.py`, ...) used to derive the confirmed facts above live in `fifa17srv/`. They
+operate on an `EBOOT.ELF` you extract yourself from **your own** legitimate copy of the game — the
+ELF is **not** in this repository and must never be committed. Each tool prints its own usage on
+`--help` or bad args.
 
 - `find_callers.py <eboot.elf> <target_hex_va>`: dependency-free (no capstone), finds all `bl`/`b`
   instructions in `.text` whose branch target resolves to the given VA, by parsing ELF64 PT_LOAD
@@ -967,7 +1020,7 @@ manual byte-scanning, and do them against `v3_EBOOT.ELF`, not `v2_EBOOT.ELF`):
    powershell -ExecutionPolicy Bypass -File .\tools\remove_redirector.ps1
    ```
 
-`update_and_run.ps1` (repo root) just does `git pull origin claude/new-session-ab3wdx` followed by
+`update_and_run.ps1` (repo root) just does `git pull` of the current branch followed by
 `python -m fifa17srv run`, run from the repo root via `$PSScriptRoot`. It exists because
 `logs/`, `certs/`, and `config.json` are all gitignored, so there is never anything local worth
 preserving — no need for `git add`/`commit`/`push` before pulling.

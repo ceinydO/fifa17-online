@@ -228,8 +228,8 @@ def _persona_user_id(name: str) -> int:
     """Stabilny falszywy UID dla persony INNEJ niz lokalnie zalogowana sesja (multi-gracz, np. dwie
     instancje RPCS3 polaczone przez RPCN) -- unika kolizji z LOCAL_USER_ID/LOCAL_PERSONA_ID, ktore sa
     zarezerwowane dla wlasnej tozsamosci polaczonej sesji. Bez tego kazdy gracz dostawal identyczny
-    BlazeId, wiec np. lookupUsersByPersonaNames('odyniec') wykonane przez sesje 'reinoldo' zwracalo
-    wpis z tym samym ID co sesja reinoldo -- klient wykrywal sprzecznosc (ten sam BlazeId, inna nazwa
+    BlazeId, wiec np. lookupUsersByPersonaNames('playerA') wykonane przez sesje 'playerB' zwracalo
+    wpis z tym samym ID co sesja playerB -- klient wykrywal sprzecznosc (ten sam BlazeId, inna nazwa
     persony niz wlasna) i padal (rozlaczenie ~10-20s po odpowiedzi)."""
     h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
     return 2000000000 + (h % 1000000000)
@@ -761,7 +761,7 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
 
 
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
-                              canary: bool = False) -> bytes:
+                              canary: bool = False, advertise_host: str = "127.0.0.1") -> bytes:
     """fetchClientConfig: top-level pole CONF = mapa string->string.
     Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze.
 
@@ -776,7 +776,7 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
     klucz w mapie string->string jest bezpieczny -- reszta kluczy po prostu jest ignorowana)."""
     disable_fe_stage3_thread = [("NEW_THREAD_FOR_FE_INIT_STAGE3", "0")]
     if cfid == "IdentityParams":
-        redirect = "http://canary-redirect.test/success" if canary else "http://127.0.0.1/success"
+        redirect = "http://canary-redirect.test/success" if canary else f"http://{advertise_host}/success"
         items = [("display", "console2/welcome"), ("redirect_uri", redirect)]
         if canary:
             # Diagnostyka: w EBOOT klucz "nucleusConnect" stoi tuz przy szablonie
@@ -869,7 +869,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     for tag, t, v in fields:
                         if tag == "CFID":
                             cfid = v
-                    resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts)
+                    resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts,
+                                                      cfg.blaze_advertise_host)
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")
                 elif component == AUTH_COMPONENT and command == LOGIN_COMMAND:
                     resp = build_login_response(component, command, msg_num, fields, cfg.login_groups)
@@ -971,7 +972,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     # klient opakowuje dane w CMGD {GGTY,GVER,OSID,PNET,XNET} i GMCD {ATTR,CRIT,GNAM,
                     # GSET,NTOP,PMAX,PMIN,PRES,QCAP,...} zamiast pol plaskich na najwyzszym poziomie --
                     # GNAM/PMAX/NTOP sa WEWNATRZ GMCD, GVER (nie VSTR) jest wewnatrz CMGD. PLJD.PLDL
-                    # zawiera TYLKO wlasny wpis gracza-tworcy (USID.NAME='odyniec' w przechwycie), NIE
+                    # zawiera TYLKO wlasny wpis gracza-tworcy (USID.NAME='playerA' w przechwycie), NIE
                     # tozsamosc zapraszanego -- ten kto ma zostac zaproszony nie jest w tym zadaniu wcale,
                     # wiec budujemy to z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie dwoch
                     # graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
