@@ -15,6 +15,43 @@ game itself.
 > source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
 > session (human or Claude) does not have to re-derive it from scratch.
 
+## Latest session: 2026-10-08 (read this first)
+
+**Goal:** get two real players (two PCs, RPCS3, Radmin VPN) past "Sending match invite and creating a
+game session. Please wait..." in Online Friendlies and into a match. **Not achieved yet** — the
+host still waits after `createGame`. Everything below is pushed to `main`; none of the newest
+server changes has been run on a live client yet (only a local two-client simulation).
+
+**Verified this session**
+- Client crash after a populated `lookupUsersByPersonaNames` reply was caused by a wrong `UserData`
+  shape (fixed: `{EDAT{ADDR unset}, FLGS, USER{...}}`).
+- After `NotifyGameSetup` both clients bind UDP 3659/9999 and send `updateMeshConnection`
+  (`STAT=2`) + `finalizeGameCreation`; no peer UDP traffic was observed and the host never proceeds.
+- TDF member lists were read from the reflection tables in `EBOOT.ELF` (tool: `tdfauto.py`, not in
+  repo), which showed several shapes differed from the FIFA 14 definitions: `NotifyPlatformHostInitialized`
+  = {GID, PHID, PHST}, `NotifyPlayerJoinCompleted` = {GID, PID, TIME}, `ReplicatedGamePlayer` has
+  EXBL/LOC/NASP/PATT/TIME, `ReplicatedGameData` has no `HSES`.
+- The client's Game class expects the topology host (`THST.HPID`) to be present in the roster under
+  the same PID, and treats players joining a game that is not yet in PRE_GAME as deferred.
+
+**Changes pushed (all unverified on a live client, each has a `config.json` switch — see
+`TEST_PLAN.md`)**
+- `gm_deferred_pregame` (default on): game starts in INITIALIZING(1); PRE_GAME(130) is sent only after
+  the host's `finalizeGameCreation`.
+- `gm_faithful_flow` (default on): host gets `NotifyGameSetup` alone; the invitee gets its setup
+  (plus `NotifyPlatformHostInitialized`) only after the host's `finalizeGameCreation`, and the host
+  gets `NotifyPlayerJoining`.
+- Corrected notification shapes (above) and richer roster players.
+- `advanceGameState` / `setGameAttributes` / `setPlayerAttributes` are acknowledged and broadcast to
+  all players of the game.
+
+**Still unknown:** what exactly makes the client raise `EVENT_CREATEGAME_SUCCESS` for the host, and
+how the game sends the actual invitation to the friend. Next step if the host still hangs: follow
+`TEST_PLAN.md`, then capture UDP 3659/9999 with Wireshark on the Radmin adapter.
+
+Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
+"Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".
+
 ## Current status (as of 2026-09-28)
 
 The full PS3 client login handshake **works end-to-end**: redirector → TLS → PreAuth → Ping →
