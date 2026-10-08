@@ -289,11 +289,11 @@ def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: in
     ]
 
 
-def build_user_added(identity) -> bytes:
+def build_user_added(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID) -> bytes:
     """NotifyUserAdded {DATA: UserSessionExtendedData, USER: UserIdentification} (0x7802/0x0002).
     Definicje pol odczytane z EBOOT. DATA zawiera tylko nieustawiona unie ADDR (jak w logach SDK innych gier)."""
     data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
-    payload = tdf.encode([("DATA", tdf.STRUCT, data), ("USER", tdf.STRUCT, build_user_identification(identity))])
+    payload = tdf.encode([("DATA", tdf.STRUCT, data), ("USER", tdf.STRUCT, build_user_identification(identity, uid, persona_id))])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
@@ -880,6 +880,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"TDF decode wyjatek: {exc}")
 
                 resp = None
+                pre_extras = []    # ramki wysylane PRZED odpowiedzia (np. UserAdded przed wynikiem lookup)
                 extras = []        # dodatkowe ramki (powiadomienia) wysylane zaraz po odpowiedzi
                 if msg_type == MSG_PING:
                     resp = build_keepalive_reply(req_header)
@@ -965,6 +966,16 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     plst_v = _find_field(fields, "PLST")
                     persona_names = list(plst_v[1]) if plst_v else []
                     resp = build_lookup_users_response(component, command, msg_num, identity, persona_names)
+                    if cfg.lookup_users_send_user_added:
+                        # Hipoteza (kod pod 0x2ef598: wynik wyszukiwania uzytkownika po ID to r31==NULL,
+                        # potem odczyt 0x90(r31)): klient nie zna uzytkownika z odpowiedzi lookup, bo
+                        # menedzer uzytkownikow SDK dostaje obcych uzytkownikow przez NotifyUserAdded.
+                        for pname in persona_names:
+                            if pname == identity[0]:
+                                continue
+                            p_name, p_ext, p_blob, p_uid, p_pid = identity_for_persona(pname, identity)
+                            pre_extras.append((f"NotifyUserAdded [0x7802::0x0002] dla {pname!r}",
+                                               build_user_added((p_name, p_ext, p_blob), p_uid, p_pid)))
                     cap.note(f"-> wysylam odpowiedz na lookupUsersByPersonaNames dla {persona_names!r} "
                              f"[ULST=LIST<UserData> (tag z Impulsum14, ksztalt EXBB/EXID/ID/NAME/NASP/FLGS "
                              f"z EBOOT), bez shotgun fallback USER/VALU/DATA/LIST -- patrz komentarz przy "
@@ -1078,6 +1089,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"wysylam pusta odpowiedz Reply (msg_num={msg_num})")
 
                 with send_lock:
+                    for label, frame in pre_extras:
+                        cap.note(f"-> wysylam PRZED odpowiedzia {label}, {len(frame)-HDR_LEN}B payloadu")
+                        cap.data("S->C", frame)
+                        stream.sendall(frame)
                     if resp is not None:
                         cap.data("S->C", resp)
                         stream.sendall(resp)

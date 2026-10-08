@@ -77,6 +77,9 @@ class Config:
     # odpowiedzi (zamiast calkowitego jej braku, jak inne nieobslugiwane komendy) jest wyzwalaczem.
     # True = odpowiadamy pusto (jak NIEOBSLUZONE), tak jakbysmy w ogole nie mieli handlera.
     lookup_users_empty_reply: bool = False
+    # Przed odpowiedzia na lookupUsersByPersonaNames wyslij NotifyUserAdded dla kazdej obcej persony
+    # z zapytania (te same ID co w odpowiedzi). Eksperyment 2026-10-08, patrz blaze.py.
+    lookup_users_send_user_added: bool = True
 
     @property
     def cert_dir_path(self) -> Path:
