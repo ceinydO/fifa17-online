@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 
-from . import __version__, blaze, nucleus, pow_stub, qos, redirector, telemetry_stub
+from . import __version__, blaze, nucleus, pow_stub, qos, redirector, tcp_record, telemetry_stub
 from .analyze import analyze_file
 from .certs import ensure_certs
 from .config import load_config
@@ -61,6 +61,10 @@ def cmd_run(args) -> int:
     tsrv = Server("telemetry", cfg.bind_address, cfg.telemetry_port,
                   lambda c, a: telemetry_stub.handle(c, a, cfg, ctx)).start()
     pow_srvs = []
+    if cfg.serve_post_auth:
+        pow_srvs.append(Server("ticker", cfg.bind_address, cfg.ticker_port,
+                               lambda c, a: tcp_record.handle(c, a, cfg, "ticker")).start())
+        print(f"  ticker     : {cfg.bind_address}:{cfg.ticker_port} (atrapa, nagrywa)")
     if cfg.serve_pow_config:
         pow_srvs = [
             Server("pow", cfg.bind_address, cfg.pow_port,

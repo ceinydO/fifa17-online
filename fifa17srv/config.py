@@ -51,6 +51,13 @@ class Config:
     pow_port: int = 8094
     pow_content_port: int = 8080
 
+    # Util::postAuth / getTelemetryServer: adresy serwera ticker (gorny pasek) i telemetrii (patrz blaze.py).
+    serve_post_auth: bool = True
+    ticker_port: int = 6776
+    ea_telemetry_port: int = 6767
+    # Klucze OSDK_* (bufory peer, limity gier, timeouty) w fetchClientConfig, jak w dzialajacym serwerze FIFA 14.
+    serve_osdk_core_defaults: bool = True
+
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
     # trwale ustawienia uzytkownikow (Util::userSettings*), np. FirstTimeFlag -- zeby rejestracja nie wracala

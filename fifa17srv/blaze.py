@@ -44,6 +44,8 @@ PRE_AUTH_COMMAND = 0x0007
 PING_COMMAND = 0x0002
 FETCH_CLIENT_CONFIG_COMMAND = 0x0001
 AUTH_COMPONENT = 0x0001
+UTIL_GET_TELEMETRY_SERVER_COMMAND = 0x0005   # Util::getTelemetryServer {CMAC, SNAM}
+UTIL_POST_AUTH_COMMAND = 0x0008              # Util::postAuth {DSUI, MAC, UDID} -> {TELE, TICK, UROP}
 GET_ACCOUNT_COMMAND = 0x001E   # Authentication::getAccount -- nazwa z tabeli komend w EBOOT (0x00C778CC)
 USER_SETTINGS_LOAD_COMMAND = 0x000A      # Util::userSettingsLoad {KEY, UID} -> {DATA, KEY}
 USER_SETTINGS_SAVE_COMMAND = 0x000B      # Util::userSettingsSave {DATA, KEY, UID}
@@ -875,6 +877,58 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
     return build_header(0, component, command, msg_num, msg_type=MSG_PING_REPLY)
 
 
+def build_telemetry_server(host: str, port: int):
+    """Blaze::Util::GetTelemetryServerResponse (pola z refleksji EBOOT; wartosci jak w dzialajacym
+    serwerze FIFA 14 Impulsum14, ale SPCT=0 -- klient nie wysyla telemetrii)."""
+    return [
+        ("ADRS", tdf.STRING, host),
+        ("ANON", tdf.VARINT, 0),
+        ("DISA", tdf.STRING, ""),
+        ("EDCT", tdf.VARINT, 0),
+        ("FILT", tdf.STRING, ""),
+        ("LOC ", tdf.VARINT, DEFAULT_LOCALE),
+        ("MINR", tdf.VARINT, 0),
+        ("NOOK", tdf.STRING, ""),
+        ("PORT", tdf.VARINT, port),
+        ("SDLY", tdf.VARINT, 15000),
+        ("SESS", tdf.STRING, "fifa17"),
+        ("SKEY", tdf.STRING, "key"),
+        ("SPCT", tdf.VARINT, 0),
+        ("STIM", tdf.STRING, "0"),
+        ("SVNM", tdf.STRING, "fifa-2017-ps3"),
+    ]
+
+
+def build_post_auth_response(component: int, command: int, msg_num: int, host: str,
+                             telemetry_port: int, ticker_port: int) -> bytes:
+    """Util::postAuth -> PostAuthResponse {TELE, TICK, UROP}. Dotad odpowiadalismy pusto, wiec klient
+    nie mial adresu serwera ticker (gorny pasek) ani telemetrii."""
+    payload = tdf.encode([
+        ("TELE", tdf.STRUCT, build_telemetry_server(host, telemetry_port)),
+        ("TICK", tdf.STRUCT, [("ADRS", tdf.STRING, host), ("PORT", tdf.VARINT, ticker_port),
+                              ("SKEY", tdf.STRING, "key")]),
+        ("UROP", tdf.STRUCT, [("TMOP", tdf.VARINT, 0), ("UID ", tdf.VARINT, LOCAL_USER_ID)]),
+    ])
+    return build_reply(component, command, msg_num, payload)
+
+
+# Klucze konfiguracji OSDK czytane przez rdzen klienta (EBOOT 0x270c40) -- wartosci z dzialajacego serwera
+# FIFA 14 (Impulsum14). Bez nich klient uzywa wlasnych domyslnych.
+OSDK_CORE_DEFAULTS = [
+    ("OSDK_PEERBUFFERSIZE", "16384"),
+    ("OSDK_DISTBUFFERSIZE_IN", "16384"),
+    ("OSDK_DISTBUFFERSIZE_OUT", "16384"),
+    ("OSDK_MAXGAMES", "16"),
+    ("OSDK_MAXROOMS", "16"),
+    ("OSDK_USERROOM_PREFIX", "room"),
+    ("OSDK_MATCHUP_TIMEOUT", "30"),
+    ("OSDK_KEEPALIVEINTERVAL", "30"),
+    ("OSDK_STATS_EMPTY_CELL", "-1"),
+    ("OSDK_TICKER_COUNT", "10"),
+    ("JOIN_GAME_TIMEOUT", "30"),
+]
+
+
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
                               canary: bool = False, advertise_host: str = "127.0.0.1",
                               extra_items=None) -> bytes:
@@ -989,17 +1043,26 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     for tag, t, v in fields:
                         if tag == "CFID":
                             cfid = v
-                    extra_items = []
+                    extra_items = list(OSDK_CORE_DEFAULTS) if cfg.serve_osdk_core_defaults else []
                     if cfg.serve_pow_config:
                         # klucze konfiguracji serwera czytane przez POWService (EBOOT 0x232550); bez nich adres
                         # uslugi jest pusty i gra pokazuje komunikat o niedostepnych serwerach
-                        extra_items = [
+                        extra_items += [
                             ("FIFA_POW_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_port}"),
                             ("FIFA_POW_CONTENT_SERVER_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_content_port}"),
                         ]
                     resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts,
                                                       cfg.blaze_advertise_host, extra_items)
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")
+                elif component == UTIL_COMPONENT and command == UTIL_POST_AUTH_COMMAND and cfg.serve_post_auth:
+                    resp = build_post_auth_response(component, command, msg_num, cfg.blaze_advertise_host,
+                                                    cfg.ea_telemetry_port, cfg.ticker_port)
+                    cap.note(f"-> wysylam PostAuthResponse {{TELE, TICK, UROP}} (Reply, msg_num={msg_num}), "
+                             f"{len(resp)-HDR_LEN}B payloadu")
+                elif component == UTIL_COMPONENT and command == UTIL_GET_TELEMETRY_SERVER_COMMAND and cfg.serve_post_auth:
+                    resp = build_reply(component, command, msg_num, tdf.encode(
+                        build_telemetry_server(cfg.blaze_advertise_host, cfg.ea_telemetry_port)))
+                    cap.note(f"-> wysylam GetTelemetryServerResponse (Reply, msg_num={msg_num})")
                 elif component == AUTH_COMPONENT and command == LOGIN_COMMAND:
                     resp = build_login_response(component, command, msg_num, fields, cfg.login_groups)
                     cap.note(f"-> wysylam LoginResponse [{cfg.login_groups or 'same flagi'}] (Reply, msg_num={msg_num}), "

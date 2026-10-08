@@ -69,6 +69,20 @@ zalogowaniu. Serwer dodaje teraz te klucze do odpowiedzi fetchClientConfig i ma 
 prawdziwa usluga -- celem jest poznanie protokolu. Wylaczenie: `"serve_pow_config": false`.
 (Mapa CONF w fetchClientConfig jest teraz sortowana po kluczu.)
 
+### Baner EAS FC -- nowe ustalenia (2026-10-08, wieczor)
+Test z `FIFA_POW_URL` w konfiguracji NIE zmienil banera i klient nie polaczyl sie z portami 8094/8080 (patrz
+log: nadal `DnsHook: DNS query for ` z pusta nazwa), wiec POW nie byl przyczyna. Baner zmienia sie sam po
+chwili z "The EAS FC servers are unavailable..." na "PRESS THE START BUTTON TO RE-CONNECT" -- przy otwartym
+polaczeniu Blaze (RPCS3 zamyka je dopiero po wcisnieciu START). Odkrycia z EBOOT:
+- `Util` komenda 8 to **postAuth** (zadanie {DSUI, MAC, UDID}, odpowiedz {TELE, TICK, UROP}); serwer odpowiadal
+  pusto, wiec klient nie dostawal adresu serwera **ticker** (gorny pasek) ani telemetrii. Komenda 5 to
+  getTelemetryServer. Teraz oba sa obslugiwane (wartosci z dzialajacego serwera FIFA 14 Impulsum14).
+- Komponent **0x08C9 to OSDKSettings** (fetchSettings = 1, fetchSettingsGroups = 2), a nie "Seasons".
+- Modul konfiguracji klienta ("scfg") trzyma grupy OSDK_CORE/CLIENT/NUCLEUS/WEBOFFER/ABUSE_REPORTING/TICKER
+  z fetchClientConfig. Dodano klucze OSDK_PEERBUFFERSIZE, OSDK_MAXGAMES, OSDK_MATCHUP_TIMEOUT itd.
+- Atrapa TCP na porcie 6776 (ticker) nagrywa, co klient wysyla (logs/captures/ticker_*.txt).
+Przelaczniki: `serve_post_auth`, `serve_osdk_core_defaults`, `serve_pow_config`.
+
 Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
 "Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".
 
