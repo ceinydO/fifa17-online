@@ -535,6 +535,28 @@ def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc:
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
 
 
+UPDATE_MESH_CONNECTION_COMMAND = 0x001D      # FIFA17: {FLGS, GID, QOSI, SCG, STAT, TCG}; STAT 2 = CONNECTED
+FINALIZE_GAME_CREATION_COMMAND = 0x000F      # {GID, NPSI, XNNC, XSES}
+NOTIFY_PLAYER_JOIN_COMPLETED = 0x001E
+NOTIFY_PLATFORM_HOST_INITIALIZED = 0x0047
+_GAMES: dict = {}   # game_id -> {"host": name, "players": [names]}
+
+
+def _uid_seen_by(viewer: str, name: str) -> int:
+    """BlazeId gracza `name` widziany przez klienta `viewer` (siebie zna jako LOCAL_USER_ID)."""
+    return LOCAL_USER_ID if viewer == name else _persona_user_id(name)
+
+
+def build_notify_player_join_completed(game_id: int, pid: int) -> bytes:
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, pid)])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOIN_COMPLETED, payload)
+
+
+def build_notify_platform_host_initialized(game_id: int, slot: int = 0) -> bytes:
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHST", tdf.VARINT, slot)])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLATFORM_HOST_INITIALIZED, payload)
+
+
 NOTIFY_GAME_STATE_CHANGE = 0x0064
 NOTIFY_GAME_PLAYER_STATE_CHANGE = 0x0074
 
@@ -1063,6 +1085,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(Reply, msg_num={msg_num})")
 
                     other_list = list(other_names)
+                    _GAMES[game_id] = {"host": host_name, "players": [host_name] + other_list}
                     network_topology = _find_field(gmcd_v, "NTOP") or 130
                     echo = {"GSET": _find_field(gmcd_v, "GSET") or 0,
                             "PRES": _find_field(gmcd_v, "PRES") or 1,
@@ -1127,6 +1150,39 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             inv_followups.append(build_notify_game_state_change(game_id))
                             for fr in inv_followups:
                                 _send_frame(other_name, fr, cap, "GameManager follow-up (zaproszony)")
+                elif (component == GAME_MANAGER_COMPONENT and identity is not None
+                      and command in (UPDATE_MESH_CONNECTION_COMMAND, FINALIZE_GAME_CREATION_COMMAND)
+                      and cfg.gm_followups):
+                    gid = _find_field(fields, "GID") or 0
+                    resp = build_reply(component, command, msg_num, b"")
+                    game = _GAMES.get(gid)
+                    me = identity[0]
+                    if game is None:
+                        cap.note(f"-> GameManager 0x{command:04X} dla nieznanej gry GID={gid}: pusta odpowiedz")
+                    elif command == UPDATE_MESH_CONNECTION_COMMAND and _find_field(fields, "STAT") == 2:
+                        cap.note(f"-> updateMeshConnection od {me!r} GID={gid} STAT=CONNECTED: "
+                                 f"rozsylam ACTIVE_CONNECTED + NotifyPlayerJoinCompleted do {game['players']}")
+                        for viewer in game["players"]:
+                            pid = _uid_seen_by(viewer, me)
+                            frames = [build_notify_game_player_state_change(gid, pid),
+                                      build_notify_player_join_completed(gid, pid)]
+                            for fr in frames:
+                                if viewer == me:
+                                    extras.append(("GameManager join-completed (do nadawcy)", fr))
+                                else:
+                                    _send_frame(viewer, fr, cap, "GameManager join-completed")
+                    elif command == FINALIZE_GAME_CREATION_COMMAND:
+                        cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: "
+                                 f"NotifyPlatformHostInitialized do {game['players']}")
+                        for viewer in game["players"]:
+                            fr = build_notify_platform_host_initialized(gid)
+                            if viewer == me:
+                                extras.append(("NotifyPlatformHostInitialized", fr))
+                            else:
+                                _send_frame(viewer, fr, cap, "NotifyPlatformHostInitialized")
+                    else:
+                        cap.note(f"-> GameManager 0x{command:04X} GID={gid} STAT={_find_field(fields, 'STAT')}: "
+                                 f"pusta odpowiedz")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
