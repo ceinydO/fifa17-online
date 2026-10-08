@@ -1062,22 +1062,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam CreateGameResponse GID={game_id} dla {host_name!r} "
                              f"(Reply, msg_num={msg_num})")
 
-                    roster = [build_replicated_game_player(host_name, identity, LOCAL_USER_ID,
-                                                            LOCAL_PERSONA_ID, game_id, host_ip, host_port,
-                                                            slot_id=0, team_index=0)]
-                    invited = []
-                    for other_name in other_names:
-                        other_p_name, other_ext_id, other_blob, other_uid, other_persona_id = \
-                            identity_for_persona(other_name, identity)
-                        with _PLAYERS_LOCK:
-                            other_info = _PLAYERS.get(other_name, {})
-                        other_ip, other_port = other_info.get("ip", 0), other_info.get("port", 0)
-                        roster.append(build_replicated_game_player(
-                            other_p_name, (other_p_name, other_ext_id, other_blob), other_uid,
-                            other_persona_id, game_id, other_ip, other_port,
-                            slot_id=len(roster), team_index=1))
-                        invited.append(other_name)
-
+                    other_list = list(other_names)
                     network_topology = _find_field(gmcd_v, "NTOP") or 130
                     echo = {"GSET": _find_field(gmcd_v, "GSET") or 0,
                             "PRES": _find_field(gmcd_v, "PRES") or 1,
@@ -1088,15 +1073,38 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             "CRIT": _find_field(gmcd_v, "CRIT"),
                             "CAP": _find_field(fields, "PCAP"),
                             "TIDS": _find_field(fields, "TIDS")}
-                    game_data = build_replicated_game_data(game_id, game_name, host_ip, host_port,
-                                                            max_players, proto_version, network_topology,
-                                                            host_uid=LOCAL_USER_ID if host_name == identity[0] else 0,
-                                                            extra=echo)
-                    extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)",
-                                    build_notify_game_setup(game_data, roster, setup_reason_disc=0)))
+
+                    def make_setup(viewer: str, disc: int):
+                        """NotifyGameSetup widziany oczami gracza `viewer`: kazdy klient zna SIEBIE pod
+                        LOCAL_USER_ID, a pozostalych pod ich haszowanymi BlazeId (jak w lookupUsers)."""
+                        with _PLAYERS_LOCK:
+                            v_entry = _PLAYERS.get(viewer, {})
+                        v_ident = v_entry.get("identity") or identity
+                        roster_v = []
+                        host_uid_v = LOCAL_USER_ID
+                        for slot, pname in enumerate([host_name] + other_list):
+                            p_name, p_ext, p_blob, p_uid, p_pid = identity_for_persona(pname, v_ident)
+                            with _PLAYERS_LOCK:
+                                p_info = _PLAYERS.get(pname, {})
+                            if pname == host_name:
+                                host_uid_v = p_uid
+                            roster_v.append(build_replicated_game_player(
+                                p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
+                                p_info.get("ip", 0), p_info.get("port", 0),
+                                slot_id=slot, team_index=min(slot, 1)))
+                        gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
+                                                        max_players, proto_version, network_topology,
+                                                        host_uid=host_uid_v, extra=echo)
+                        return roster_v, build_notify_game_setup(gd, roster_v, setup_reason_disc=disc)
+
+                    invited = list(other_list)
+                    host_roster, host_frame = make_setup(host_name, 0)
+                    extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)", host_frame))
+                    invited_rosters = {}
                     if invited:
                         for other_name in invited:
-                            frame = build_notify_game_setup(game_data, roster, setup_reason_disc=2)
+                            inv_roster, frame = make_setup(other_name, 2)
+                            invited_rosters[other_name] = inv_roster
                             if not _send_frame(other_name, frame, cap,
                                                "NotifyGameSetup [0x0004::0x0014] "
                                                "(zaproszony, IndirectJoinGameSetupContext)"):
@@ -1104,6 +1112,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                          f"(rozlaczony?)")
                     else:
                         cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
+                    roster = host_roster
                     if cfg.gm_followups:
                         followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
                                       build_notify_game_player_state_change(game_id, pid))
@@ -1112,8 +1121,12 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                           build_notify_game_state_change(game_id)))
                         extras.extend(followups)
                         for other_name in invited:
-                            for label, frame in followups:
-                                _send_frame(other_name, frame, cap, label + " (zaproszony)")
+                            inv_pids = [_find_field(p, "PID ") for p in invited_rosters.get(other_name, [])]
+                            inv_followups = [build_notify_game_player_state_change(game_id, pid)
+                                             for pid in inv_pids]
+                            inv_followups.append(build_notify_game_state_change(game_id))
+                            for fr in inv_followups:
+                                _send_frame(other_name, fr, cap, "GameManager follow-up (zaproszony)")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
