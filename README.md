@@ -1150,3 +1150,10 @@ Z tablic klas TDF w EBOOT.ELF (zweryfikowane): `NotifyPlatformHostInitialized` =
 `NotifyGamePlayerStateChange` = {GID, PID, STAT}, `NotifyGameStateChange` = {GID, GSTA},
 `NotifyPlayerJoining` = {GID, PDAT, QOST}. `NotifyGameSetup` ma pola GAME, LFPJ, MNAM, PROS, QOSS,
 QOSV, QUEU, REAS, TELM. Narzedzie: `tdfauto.py` (poza repo).
+
+`NotifyPlatformHostInitialized` = {GID, PHID, PHST(slot)} (3 pola). `ReplicatedGamePlayer` wg refleksji:
+CSID, DSUI, EXBL, EXID, GID, JFPS, JVMM, LOC, NAME, NASP, PATT, PID, PNET, PSET, RCRE, ROLE, SID, SLOT,
+STAT, TIDX, TIME, UGID, UID, UUID -- do rostera dodano EXBL (NpId), LOC, NASP, PATT, TIME.
+`ReplicatedGameData`: ADMN APRS ATTR CAP COID CRIT CTIM DHST DNET ESNM GGTY GID GMRG GNAM GPVH GSET GSID
+GSTA GTYP GURL HNET MATR MCAP MNCP NPSI NQOS NRES NTOP PGID PGSR PHST PRES PSAS QCAP RNFO SCID SEED STMN
+THST TIDS UUID VOIP VSTR XNNC XSES (HSES, ktorego wysylalismy, tam nie istnieje).

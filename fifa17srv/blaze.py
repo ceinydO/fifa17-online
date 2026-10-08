@@ -472,9 +472,15 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
     rozroznienie uid/persona_id co reszta projektu (identity_for_persona)."""
     _, ext_id, _blob = identity
     return [
+        # Pola dodane wg refleksji EBOOT (ReplicatedGamePlayer: EXBL externalBlob, LOC accountLocale,
+        # NASP personaNamespace, PATT playerAttribs, TIME joinedGameTimestamp).
+        ("EXBL", tdf.BLOB, _blob),
         ("EXID", tdf.VARINT, ext_id),
         ("GID ", tdf.VARINT, game_id),
+        ("LOC ", tdf.VARINT, DEFAULT_LOCALE),
         ("NAME", tdf.STRING, name),
+        ("NASP", tdf.STRING, PERSONA_NAMESPACE),
+        ("PATT", tdf.MAP, (tdf.STRING, tdf.STRING, [])),
         # PID = PlayerId = BlazeId uzytkownika (to samo co UserIdentification.ID, USID.ID w createGame);
         # wczesniej byl tu persona_id (PIDI), przez co SDK nie mogl dopasowac gracza z rostera do
         # lokalnego uzytkownika (log 2026-10-08: host dostawal PID=1000000002 zamiast BlazeId 1000000001).
@@ -484,6 +490,7 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
         ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
         ("STAT", tdf.VARINT, state),      # PlayerState: 2=ACTIVE_CONNECTING, 4=ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
         ("TIDX", tdf.VARINT, team_index),
+        ("TIME", tdf.VARINT, int(time.time())),
         ("UID ", tdf.VARINT, uid),
     ]
 
@@ -575,7 +582,8 @@ def build_notify_player_joining(game_id: int, player_fields) -> bytes:
 
 def build_notify_platform_host_initialized(game_id: int, platform_host_id: int = 0) -> bytes:
     # FIFA17 (refleksja EBOOT): gameId GID, platformHostId PHID (nie PHST jak w Impulsum14)
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHID", tdf.VARINT, platform_host_id)])
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHID", tdf.VARINT, platform_host_id),
+                          ("PHST", tdf.VARINT, 0)])
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLATFORM_HOST_INITIALIZED, payload)
 
 
