@@ -282,6 +282,29 @@ such as `0x0001/0x0046` cannot be named from it.
 Contributions and pointers are welcome, in particular from anyone who has traced the client's
 reconnect state machine or knows the FIFA 17 / Blaze 15.1 command tables.
 
+## Two-player status, 2026-10-08 (what is verified)
+
+Verified with two RPCS3 instances over Radmin VPN (host log + friend log + server log):
+
+* Both clients log in and stay connected; no reconnect loops.
+* **`lookupUsersByPersonaNames` crash fixed.** The reply element type is
+  `UserData = {EDAT, FLGS, USER{UserIdentification}}` (Impulsum14 `UserData.cs`, and the
+  reflection table in the executable). The old flat `{EXBB,EXID,ID,NAME,NASP,FLGS}` reply left the
+  client's user-name buffer empty; the lookup helper (0x2f12bc) then returned NULL and the caller
+  (0x2ef520) dereferenced it (`Access violation reading location 0x90` at 0x2ef598). Do not set
+  `lookup_users_empty_reply` any more.
+* The client uses our lookup result as the player reserved in `createGame` (`PLJD.PLDL`).
+* `createGame` arrives, we answer + push `NotifyGameSetup` (+ player/game state notifications)
+  to both players. **Still open:** after that the host client sends nothing more and makes no
+  `sceNp` call (no `sceNpBasicSendMessage`), it only polls friend presence every 10 s; the friend
+  client does not react. So some event the host waits for ("Sending match invite and creating a
+  game session") is still missing or malformed. Candidates: `NotifyGameSetup` field content,
+  mesh/network setup (`updateMeshConnection`, `NotifyPlayerJoinCompleted`), or invite delivery.
+* Roster `PID` must be the BlazeId (= `UserIdentification.ID`), not the persona id (fixed).
+
+Next step needs the client's `GameManager` notification handlers disassembled (string
+cross-references into the executable did not resolve with simple TOC scans).
+
 ## Online Friendlies: GameManager `createGame` (2026-09-26)
 
 **Setup used for this testing:** the user has a friend with their own physical PC and their own
