@@ -297,23 +297,17 @@ def build_user_added(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
-def build_user_data(identity, uid: int = LOCAL_USER_ID):
-    """Blaze::UserManager::UserData -- INNY typ niz UserIdentification. Znaleziony sesja 9 poprzez
-    find_tdf_members.py przeszukujac tabele refleksji pod katem pol UserIdentification: zaraz PO tej
-    tabeli w EBOOT (0x0254DD4C-0x0254DE04) siedzi OSOBNA tabela pol z dokladnie 6 tagami w tej kolejnosci:
-    EXBB (externalBlob), EXID (externalId), ID (blazeId), NAME (name), NASP (personaNamespace),
-    FLGS (statusFlags) -- FLGS potwierdzone liczbowo (enc('FLGS')<<8 == 0x9AC9F300, dokladnie ta wartosc
-    w danych). To mniejszy ksztalt niz UserIdentification (brak AID/ALOC/ORIG/PIDI) i jest silnym
-    kandydatem na prawdziwy typ elementu listy w odpowiedzi lookupUsersByPersonaNames -- w przeciwienstwie
-    do UserIdentification (uzywany tylko w NotifyUserAdded), tej tabeli nigdy nie probowalismy wyslac."""
-    name, ext_id, blob = identity
+def build_user_data(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
+    """Blaze::UserData {EDAT, FLGS, USER} (Impulsum14 UserData.cs; tagi EDAT/FLGS/USER potwierdzone tez
+    w EBOOT: kolejne wpisy tabeli refleksji pod 0x254eb08). USER to zagniezdzona UserIdentification.
+    Wczesniej wysylalismy plaska strukture EXBB/EXID/ID/NAME/NASP/FLGS -- wtedy klient nie wypelnial
+    nazwy uzytkownika, funkcja 0x2f12bc (szukanie uzytkownika po nazwie spod +0x50 elementu) zwracala
+    NULL dla pustej nazwy i 0x2ef520 dereferowal ten NULL (crash 0x2ef598, odczyt 0x90)."""
+    data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
     return [
-        ("EXBB", tdf.BLOB, blob),
-        ("EXID", tdf.VARINT, ext_id),
-        ("ID  ", tdf.VARINT, uid),
-        ("NAME", tdf.STRING, name),
-        ("NASP", tdf.STRING, PERSONA_NAMESPACE),
+        ("EDAT", tdf.STRUCT, data),
         ("FLGS", tdf.VARINT, USER_FLAG_ONLINE),
+        ("USER", tdf.STRUCT, build_user_identification(identity, uid, persona_id)),
     ]
 
 
@@ -372,7 +366,7 @@ def build_lookup_users_response(component: int, command: int, msg_num: int, own_
     user_data_structs = []
     for name in persona_names:
         p_name, p_ext_id, p_blob, uid, persona_id = identity_for_persona(name, own_identity)
-        user_data_structs.append(build_user_data((p_name, p_ext_id, p_blob), uid))
+        user_data_structs.append(build_user_data((p_name, p_ext_id, p_blob), uid, persona_id))
     fields = [("ULST", tdf.LIST, (tdf.STRUCT, user_data_structs))]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
