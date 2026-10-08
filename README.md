@@ -252,10 +252,28 @@ BUTTON TO RE-CONNECT" banner and **repeatedly perform full reconnects (redirecto
 scratch) every ~50–90 s** — in the server captures and in the client's RPCS3.log (`bind 0.0.0.0:3659`,
 `ECONNRESET`/`ENOTCONN`, `sceNpLookupInit`/`Term` cycles). This is most likely the same unresolved
 client-side watchdog described under "Current blocker" and probably explains the lost invite.
-Two hypotheses were left untested: (1) a fixed client-side timer unrelated to user actions
-(→ needs more Ghidra/live-debugger work, see `0xA46528`/`0xA465D8`), (2) a reconnect triggered by
-pressing "Play Match", in which case the invite may go to a stale entry in the `_PLAYERS` registry —
-the cheap discriminating test is two logged-in players idling 2 minutes without pressing anything.
+**Hypotheses tested on 2026-10-08 (both players connected, one click on "Play Match"):**
+1. *Fixed client-side reconnect timer* — **refuted**: an idle client keeps one Blaze connection for 2+ min
+   (only 20 s frame pings, no new redirector/login), in both server captures and RPCS3.log.
+2. *Invite lost on a stale `_PLAYERS` entry after a reconnect* — **refuted**: with a stable connection per
+   player the registry held both players (`['odyniec', 'odyniec1']`), `createGame` wrote the 399-byte
+   `NotifyGameSetup` to the invitee's live socket without error, nobody reconnected before or after, yet the
+   host stayed on "Sending match invite..." and the invitee saw nothing. (The unexplained "S->C 21 bytes" line
+   is just the 5-byte-payload `CreateGameResponse` frame, logged after the handler's own notes.)
+   A real race was fixed anyway: a closing old connection could unregister a newer connection of the same
+   player (now compares stream identity).
+
+**What the clients' RPCS3.log shows around the click:** the host calls `sceNpBasicSetPresence` with a
+**64-byte** payload when it enters the Play Match flow (~19 s *before* `createGame`); the invitee's RPCS3
+receives it as `NPHandler: basic_event: event:1, from:<host>, size:64`, then sets its own 20-byte presence.
+No `sceNpBasicSendMessage`/invite calls appear at all. After `createGame` the host sends nothing further
+(no presence update, no new Blaze request) — it is waiting for something we do not send. `Messaging`
+(component `0x000F`) requests seen so far are `fetchMessages`/`getMessages` of type `'room'` (chat rooms), not
+invites. Working theory: the invite is carried by the RPCN presence data (which should receive the game id
+after `CreateGameResponse`), and the host client stalls before updating it because some expected Blaze
+`GameManager` notification (e.g. `NotifyGameStateChange` / `NotifyGamePlayerStateChange`, or a different
+`NotifyGameSetup` shape/context) is missing or wrong. Next steps: experiment with those notifications, and
+dump the 64-byte presence payload (RPCS3 debugger on `sceNpBasicSetPresence`) to see what it encodes.
 
 Note on command IDs: Impulsum14's component/command numbering (FIFA 14 / older Blaze) does **not**
 match FIFA 17 (e.g. Authentication login is `0x000A` on the wire, not `0x28`), so unknown commands
