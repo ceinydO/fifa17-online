@@ -30,6 +30,12 @@ class Config:
     # bo host po createGame nic juz nie wysyla i wisi na "Sending match invite...". Ksztalty z Impulsum14
     # (FIFA14), niezweryfikowane na FIFA 17 -- dlatego da sie to wylaczyc w config.json.
     gm_followups: bool = True
+    # Stan graczy w liscie NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient sam laczy sie z rownymi i
+    # zglasza updateMeshConnection), 4 = ACTIVE_CONNECTED (stare zachowanie: klienci nie otwierali
+    # zadnych polaczen P2P, bo uznawali wszystkich za juz polaczonych).
+    gm_initial_player_state: int = 2
+    # NotifyPlayerJoining dla hosta o zaproszonym graczu (0x0015).
+    gm_send_player_joining: bool = True
 
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"

@@ -464,7 +464,8 @@ def build_network_address_union(ip: int, port: int):
 
 
 def build_replicated_game_player(name: str, identity, uid: int, persona_id: int, game_id: int,
-                                  ip: int, port: int, slot_id: int = 0, team_index: int = 0):
+                                  ip: int, port: int, slot_id: int = 0, team_index: int = 0,
+                                  state: int = 4):
     """Blaze::GameManager::ReplicatedGamePlayer -- pola/tagi potwierdzone w Impulsum14
     (GameManager/ReplicatedGamePlayer.cs). PID=PlayerId (BlazeId persony, jak PIDI w
     build_user_identification), UID=PlayerSessionId (jak AID/ID gdzie indziej) -- to samo
@@ -481,7 +482,7 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
         ("PNET", tdf.UNION, build_network_address_union(ip, port)),
         ("SID ", tdf.VARINT, slot_id),
         ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
-        ("STAT", tdf.VARINT, 4),          # PlayerState.ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
+        ("STAT", tdf.VARINT, state),      # PlayerState: 2=ACTIVE_CONNECTING, 4=ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
         ("TIDX", tdf.VARINT, team_index),
         ("UID ", tdf.VARINT, uid),
     ]
@@ -546,6 +547,7 @@ def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc:
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
 
 
+NOTIFY_PLAYER_JOINING = 0x0015
 UPDATE_MESH_CONNECTION_COMMAND = 0x001D      # FIFA17: {FLGS, GID, QOSI, SCG, STAT, TCG}; STAT 2 = CONNECTED
 FINALIZE_GAME_CREATION_COMMAND = 0x000F      # {GID, NPSI, XNNC, XSES}
 NOTIFY_PLAYER_JOIN_COMPLETED = 0x001E
@@ -561,6 +563,12 @@ def _uid_seen_by(viewer: str, name: str) -> int:
 def build_notify_player_join_completed(game_id: int, pid: int) -> bytes:
     payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, pid)])
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOIN_COMPLETED, payload)
+
+
+def build_notify_player_joining(game_id: int, player_fields) -> bytes:
+    """NotifyPlayerJoining {GID, PDAT: ReplicatedGamePlayer} (0x0004/0x0015)."""
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PDAT", tdf.STRUCT, player_fields)])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOINING, payload)
 
 
 def build_notify_platform_host_initialized(game_id: int, slot: int = 0) -> bytes:
@@ -1126,7 +1134,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             roster_v.append(build_replicated_game_player(
                                 p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
                                 p_info.get("peer_ip") or p_info.get("ip", 0), p_info.get("port", 0) or 3659,
-                                slot_id=slot, team_index=min(slot, 1)))
+                                slot_id=slot, team_index=min(slot, 1),
+                                state=cfg.gm_initial_player_state))
                         gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
                                                         max_players, proto_version, network_topology,
                                                         host_uid=host_uid_v, extra=echo)
@@ -1135,6 +1144,11 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     invited = list(other_list)
                     host_roster, host_frame = make_setup(host_name, 0)
                     extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)", host_frame))
+                    if cfg.gm_send_player_joining:
+                        # host dowiaduje sie o dolaczajacym graczu (jak w prawdziwym flow joinGame)
+                        for pl in host_roster[1:]:
+                            extras.append(("NotifyPlayerJoining [0x0004::0x0015]",
+                                           build_notify_player_joining(game_id, pl)))
                     invited_rosters = {}
                     if invited:
                         for other_name in invited:
@@ -1149,16 +1163,20 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
                     roster = host_roster
                     if cfg.gm_followups:
-                        followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
-                                      build_notify_game_player_state_change(game_id, pid))
-                                     for pid in [_find_field(p, "PID ") for p in roster]]
+                        followups = []
+                        if cfg.gm_initial_player_state == 4:
+                            followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
+                                          build_notify_game_player_state_change(game_id, pid))
+                                         for pid in [_find_field(p, "PID ") for p in roster]]
                         followups.append(("NotifyGameStateChange [0x0004::0x0064] PRE_GAME",
                                           build_notify_game_state_change(game_id)))
                         extras.extend(followups)
                         for other_name in invited:
                             inv_pids = [_find_field(p, "PID ") for p in invited_rosters.get(other_name, [])]
-                            inv_followups = [build_notify_game_player_state_change(game_id, pid)
-                                             for pid in inv_pids]
+                            inv_followups = []
+                            if cfg.gm_initial_player_state == 4:
+                                inv_followups = [build_notify_game_player_state_change(game_id, pid)
+                                                 for pid in inv_pids]
                             inv_followups.append(build_notify_game_state_change(game_id))
                             for fr in inv_followups:
                                 _send_frame(other_name, fr, cap, "GameManager follow-up (zaproszony)")

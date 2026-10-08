@@ -302,6 +302,18 @@ Verified with two RPCS3 instances over Radmin VPN (host log + friend log + serve
   mesh/network setup (`updateMeshConnection`, `NotifyPlayerJoinCompleted`), or invite delivery.
 * Roster `PID` must be the BlazeId (= `UserIdentification.ID`), not the persona id (fixed).
 
+Update (later the same evening, verified in server + RPCS3 logs):
+
+* `NotifyGameSetup` now carries host info (`THST`/`PHST`/`HSES`/`ADMN`) and echoes the client's
+  `createGame` attributes; rosters are built per viewer (a client knows itself as `LOCAL_USER_ID`).
+* After the setup both clients open UDP 3659 / 9999 and send `updateMeshConnection` (0x1D, `STAT=2`)
+  and `finalizeGameCreation` (0x0F). We answer with `ACTIVE_CONNECTED` + `NotifyPlayerJoinCompleted`
+  + `NotifyPlatformHostInitialized`. Still **no UDP traffic between the clients** and no UI progress.
+* Rosters used loopback/LAN addresses; they now use the peer's Radmin IP (the address the client
+  connects to the server from).
+* Experiment (`gm_initial_player_state`, default 2): players start as `ACTIVE_CONNECTING` so the
+  SDK has a reason to open peer connections; plus `NotifyPlayerJoining` to the host.
+
 Next step needs the client's `GameManager` notification handlers disassembled (string
 cross-references into the executable did not resolve with simple TOC scans).
 
