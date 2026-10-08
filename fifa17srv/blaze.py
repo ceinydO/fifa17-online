@@ -463,7 +463,10 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
         ("EXID", tdf.VARINT, ext_id),
         ("GID ", tdf.VARINT, game_id),
         ("NAME", tdf.STRING, name),
-        ("PID ", tdf.VARINT, persona_id),
+        # PID = PlayerId = BlazeId uzytkownika (to samo co UserIdentification.ID, USID.ID w createGame);
+        # wczesniej byl tu persona_id (PIDI), przez co SDK nie mogl dopasowac gracza z rostera do
+        # lokalnego uzytkownika (log 2026-10-08: host dostawal PID=1000000002 zamiast BlazeId 1000000001).
+        ("PID ", tdf.VARINT, uid),
         ("PNET", tdf.UNION, build_network_address_union(ip, port)),
         ("SID ", tdf.VARINT, slot_id),
         ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
