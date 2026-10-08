@@ -1142,3 +1142,11 @@ serwer wysyla NotifyGameStateChange(PRE_GAME=130). Wlaczone domyslnie; `"gm_defe
 w config.json przywraca stare zachowanie (PRE_GAME od razu). Analiza EBOOT: sukces createGame
 (EVENT_CREATEGAME_SUCCESS) jest zglaszany przez listener OSDK (0x1624e1c) wywolywany z warstwy
 GameManagerAPI; dokladny warunek wywolania nie zostal jeszcze ustalony.
+
+### Poprawka ksztaltow powiadomien z refleksji EBOOT (2026-10-08)
+
+Z tablic klas TDF w EBOOT.ELF (zweryfikowane): `NotifyPlatformHostInitialized` = {GID, **PHID**}
+(wczesniej blednie PHST z Impulsum14), `NotifyPlayerJoinCompleted` = {GID, PID, **TIME**},
+`NotifyGamePlayerStateChange` = {GID, PID, STAT}, `NotifyGameStateChange` = {GID, GSTA},
+`NotifyPlayerJoining` = {GID, PDAT, QOST}. `NotifyGameSetup` ma pola GAME, LFPJ, MNAM, PROS, QOSS,
+QOSV, QUEU, REAS, TELM. Narzedzie: `tdfauto.py` (poza repo).

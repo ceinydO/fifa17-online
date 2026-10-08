@@ -561,7 +561,9 @@ def _uid_seen_by(viewer: str, name: str) -> int:
 
 
 def build_notify_player_join_completed(game_id: int, pid: int) -> bytes:
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, pid)])
+    # FIFA17 (refleksja EBOOT: gameId GID, playerId PID, joinedGameTimestamp TIME)
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, pid),
+                          ("TIME", tdf.VARINT, int(time.time()))])
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOIN_COMPLETED, payload)
 
 
@@ -571,8 +573,9 @@ def build_notify_player_joining(game_id: int, player_fields) -> bytes:
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOINING, payload)
 
 
-def build_notify_platform_host_initialized(game_id: int, slot: int = 0) -> bytes:
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHST", tdf.VARINT, slot)])
+def build_notify_platform_host_initialized(game_id: int, platform_host_id: int = 0) -> bytes:
+    # FIFA17 (refleksja EBOOT): gameId GID, platformHostId PHID (nie PHST jak w Impulsum14)
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHID", tdf.VARINT, platform_host_id)])
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLATFORM_HOST_INITIALIZED, payload)
 
 
@@ -1208,7 +1211,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: "
                                  f"NotifyPlatformHostInitialized do {game['players']}")
                         for viewer in game["players"]:
-                            fr = build_notify_platform_host_initialized(gid)
+                            fr = build_notify_platform_host_initialized(gid, _uid_seen_by(viewer, game['host']))
                             if viewer == me:
                                 extras.append(("NotifyPlatformHostInitialized", fr))
                             else:
