@@ -555,6 +555,15 @@ def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc:
 
 
 NOTIFY_PLAYER_JOINING = 0x0015
+ADVANCE_GAME_STATE_COMMAND = 0x0003
+# zadania GameManager, ktorych skutek serwer tylko rozsyla wszystkim graczom jako powiadomienie
+# (ksztalt zadania == ksztalt powiadomienia w Impulsum14: setGameAttributes {ATTR,GID} -> 80,
+# setPlayerAttributes {ATTR,GID,PID} -> 90, advanceGameState {GID,GSTA} -> NotifyGameStateChange 100)
+GM_BROADCAST_COMMANDS = {
+    0x0003: (0x0064, "advanceGameState -> NotifyGameStateChange"),
+    0x0007: (0x0050, "setGameAttributes -> NotifyGameAttribChange"),
+    0x0008: (0x005A, "setPlayerAttributes -> NotifyPlayerAttribChange"),
+}
 UPDATE_MESH_CONNECTION_COMMAND = 0x001D      # FIFA17: {FLGS, GID, QOSI, SCG, STAT, TCG}; STAT 2 = CONNECTED
 FINALIZE_GAME_CREATION_COMMAND = 0x000F      # {GID, NPSI, XNNC, XSES}
 NOTIFY_PLAYER_JOIN_COMPLETED = 0x001E
@@ -1235,6 +1244,30 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     else:
                         cap.note(f"-> GameManager 0x{command:04X} GID={gid} STAT={_find_field(fields, 'STAT')}: "
                                  f"pusta odpowiedz")
+                elif (component == GAME_MANAGER_COMPONENT and identity is not None
+                      and command in GM_BROADCAST_COMMANDS and cfg.gm_followups):
+                    gid = _find_field(fields, "GID") or 0
+                    resp = build_reply(component, command, msg_num, b"")
+                    game = _GAMES.get(gid)
+                    me = identity[0]
+                    notif_id, label = GM_BROADCAST_COMMANDS[command]
+                    if game is None:
+                        cap.note(f"-> GameManager {label} dla nieznanej gry GID={gid}: pusta odpowiedz")
+                    else:
+                        cap.note(f"-> GameManager {label} od {me!r} GID={gid}: rozsylam do {game['players']}")
+                        for viewer in game["players"]:
+                            out = []
+                            for t, typ, v in fields:
+                                if t == "PID" and typ == tdf.VARINT:
+                                    v = _uid_seen_by(viewer, me)
+                                out.append((t, typ, v))
+                            if command == ADVANCE_GAME_STATE_COMMAND:
+                                out = [(t, typ, v) for t, typ, v in out if t in ("GID", "GSTA")]
+                            fr = build_notification(GAME_MANAGER_COMPONENT, notif_id, tdf.encode(out))
+                            if viewer == me:
+                                extras.append((f"GameManager {label}", fr))
+                            else:
+                                _send_frame(viewer, fr, cap, f"GameManager {label}")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "

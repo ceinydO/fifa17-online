@@ -1157,3 +1157,10 @@ STAT, TIDX, TIME, UGID, UID, UUID -- do rostera dodano EXBL (NpId), LOC, NASP, P
 `ReplicatedGameData`: ADMN APRS ATTR CAP COID CRIT CTIM DHST DNET ESNM GGTY GID GMRG GNAM GPVH GSET GSID
 GSTA GTYP GURL HNET MATR MCAP MNCP NPSI NQOS NRES NTOP PGID PGSR PHST PRES PSAS QCAP RNFO SCID SEED STMN
 THST TIDS UUID VOIP VSTR XNNC XSES (HSES, ktorego wysylalismy, tam nie istnieje).
+
+Dodane (niezweryfikowane na zywym kliencie): zadania GameManager advanceGameState (3), setGameAttributes (7),
+setPlayerAttributes (8) sa potwierdzane pusta odpowiedzia i rozsylane do wszystkich graczy gry jako
+NotifyGameStateChange (100) / NotifyGameAttribChange (80) / NotifyPlayerAttribChange (90).
+Analiza EBOOT: kod FIFA (0xc49180..) przelacza zmienne UI wg stanu gry: INITIALIZING(1) ustawia 'gsid'
+(id gry) dla hosta, PRE_GAME(130) ustawia 'peer'=1 -- czyli klient oczekuje przejscia 1 -> 130, co
+wspiera hipoteze gm_deferred_pregame.
