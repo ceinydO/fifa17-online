@@ -490,7 +490,7 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
 
 def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_port: int,
                                 max_players: int, proto_version: str, network_topology: int = 130,
-                                host_uid: int = LOCAL_USER_ID, extra=None):
+                                host_uid: int = LOCAL_USER_ID, extra=None, game_state: int = 130):
     """Blaze::GameManager::ReplicatedGameData (Impulsum14 GameManager/ReplicatedGameData.cs).
     GSTA=PRE_GAME(130), NTOP domyslnie PEER_TO_PEER_FULL_MESH(130).
 
@@ -506,7 +506,7 @@ def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_
         ("GID ", tdf.VARINT, game_id),
         ("GNAM", tdf.STRING, game_name),
         ("GSET", tdf.VARINT, extra.get("GSET", 0)),
-        ("GSTA", tdf.VARINT, 130),
+        ("GSTA", tdf.VARINT, game_state),
         ("GTYP", tdf.STRING, extra.get("GTYP", "gameType0")),
         ("HNET", tdf.LIST, (tdf.UNION, [build_network_address_union(host_ip, host_port)])),
         ("HSES", tdf.VARINT, host_uid),
@@ -1138,7 +1138,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                 state=cfg.gm_initial_player_state))
                         gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
                                                         max_players, proto_version, network_topology,
-                                                        host_uid=host_uid_v, extra=echo)
+                                                        host_uid=host_uid_v, extra=echo,
+                                                        game_state=1 if cfg.gm_deferred_pregame else 130)
                         return roster_v, build_notify_game_setup(gd, roster_v, setup_reason_disc=disc)
 
                     invited = list(other_list)
@@ -1168,8 +1169,9 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
                                           build_notify_game_player_state_change(game_id, pid))
                                          for pid in [_find_field(p, "PID ") for p in roster]]
-                        followups.append(("NotifyGameStateChange [0x0004::0x0064] PRE_GAME",
-                                          build_notify_game_state_change(game_id)))
+                        if not cfg.gm_deferred_pregame:
+                            followups.append(("NotifyGameStateChange [0x0004::0x0064] PRE_GAME",
+                                              build_notify_game_state_change(game_id)))
                         extras.extend(followups)
                         for other_name in invited:
                             inv_pids = [_find_field(p, "PID ") for p in invited_rosters.get(other_name, [])]
@@ -1177,7 +1179,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             if cfg.gm_initial_player_state == 4:
                                 inv_followups = [build_notify_game_player_state_change(game_id, pid)
                                                  for pid in inv_pids]
-                            inv_followups.append(build_notify_game_state_change(game_id))
+                            if not cfg.gm_deferred_pregame:
+                                inv_followups.append(build_notify_game_state_change(game_id))
                             for fr in inv_followups:
                                 _send_frame(other_name, fr, cap, "GameManager follow-up (zaproszony)")
                 elif (component == GAME_MANAGER_COMPONENT and identity is not None
@@ -1210,6 +1213,14 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                 extras.append(("NotifyPlatformHostInitialized", fr))
                             else:
                                 _send_frame(viewer, fr, cap, "NotifyPlatformHostInitialized")
+                        if cfg.gm_deferred_pregame:
+                            cap.note(f"-> GameState INITIALIZING -> PRE_GAME(130) po finalizeGameCreation GID={gid}")
+                            for viewer in game["players"]:
+                                fr = build_notify_game_state_change(gid)
+                                if viewer == me:
+                                    extras.append(("NotifyGameStateChange PRE_GAME", fr))
+                                else:
+                                    _send_frame(viewer, fr, cap, "NotifyGameStateChange PRE_GAME")
                     else:
                         cap.note(f"-> GameManager 0x{command:04X} GID={gid} STAT={_find_field(fields, 'STAT')}: "
                                  f"pusta odpowiedz")

@@ -1134,3 +1134,11 @@ update_and_run.ps1        one-command pull + run for repeat testing
 
 Other people are reviving old FIFA online modes (mostly Ultimate Team); this project focuses on
 friendlies. Contributions and shared captures are welcome. License: MIT.
+
+### Eksperyment `gm_deferred_pregame` (2026-10-08, niezweryfikowany)
+
+Hipoteza: w NotifyGameSetup gra ma GSTA=INITIALIZING(1), a dopiero po `finalizeGameCreation`
+serwer wysyla NotifyGameStateChange(PRE_GAME=130). Wlaczone domyslnie; `"gm_deferred_pregame": false`
+w config.json przywraca stare zachowanie (PRE_GAME od razu). Analiza EBOOT: sukces createGame
+(EVENT_CREATEGAME_SUCCESS) jest zglaszany przez listener OSDK (0x1624e1c) wywolywany z warstwy
+GameManagerAPI; dokladny warunek wywolania nie zostal jeszcze ustalony.

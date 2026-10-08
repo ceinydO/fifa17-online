@@ -36,6 +36,9 @@ class Config:
     gm_initial_player_state: int = 2
     # NotifyPlayerJoining dla hosta o zaproszonym graczu (0x0015).
     gm_send_player_joining: bool = True
+    # Hipoteza (2026-10-08): gra startuje w GSTA=INITIALIZING(1) i dopiero po finalizeGameCreation
+    # serwer przesuwa ja do PRE_GAME(130) (NotifyGameStateChange). False = PRE_GAME od razu (stare).
+    gm_deferred_pregame: bool = True
 
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
