@@ -117,9 +117,10 @@ _GAMES_LOCK = threading.Lock()
 _next_game_id = [1]
 
 
-def _register_player(name: str, stream, send_lock: threading.Lock) -> None:
+def _register_player(name: str, stream, send_lock: threading.Lock, identity=None) -> None:
     with _PLAYERS_LOCK:
-        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0}
+        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0,
+                          "identity": identity}
 
 
 def _unregister_player(name: str, stream) -> bool:
@@ -262,6 +263,13 @@ def identity_for_persona(name: str, own_identity):
     if name == own_name:
         return name, own_ext_id, own_blob, LOCAL_USER_ID, LOCAL_PERSONA_ID
     uid = _persona_user_id(name)
+    # Prawdziwy EXTI/EXTB (NpId) drugiego gracza znamy z jego loginu (rejestr) -- uzywamy go zamiast
+    # kopii wlasnego, jesli ten gracz jest polaczony.
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+    real = entry.get("identity") if entry else None
+    if real is not None:
+        return name, real[1], real[2], uid, uid + 1
     return name, own_ext_id, own_blob, uid, uid + 1
 
 
@@ -900,7 +908,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam LoginResponse [{cfg.login_groups or 'same flagi'}] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                     identity = login_identity(fields)
-                    _register_player(identity[0], stream, send_lock)
+                    _register_player(identity[0], stream, send_lock, identity)
                     with _PLAYERS_LOCK:
                         cap.note(f"-> rejestr graczy po loginie {identity[0]!r}: {sorted(_PLAYERS)}")
                     if cfg.send_user_authenticated:
