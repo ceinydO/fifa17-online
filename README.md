@@ -1164,3 +1164,9 @@ NotifyGameStateChange (100) / NotifyGameAttribChange (80) / NotifyPlayerAttribCh
 Analiza EBOOT: kod FIFA (0xc49180..) przelacza zmienne UI wg stanu gry: INITIALIZING(1) ustawia 'gsid'
 (id gry) dla hosta, PRE_GAME(130) ustawia 'peer'=1 -- czyli klient oczekuje przejscia 1 -> 130, co
 wspiera hipoteze gm_deferred_pregame.
+
+### Przebieg `gm_faithful_flow` (2026-10-08, domyslnie wlaczony, niezweryfikowany)
+createGame: host dostaje NotifyGameSetup tylko ze soba (stan CONNECTED, GSTA=INITIALIZING). Po jego
+finalizeGameCreation serwer wysyla hostowi PRE_GAME + PlatformHostInitialized, a zaproszonemu
+NotifyGameSetup (PRE_GAME, roster host+on, IndirectJoin) + PlatformHostInitialized; host dostaje
+NotifyPlayerJoining. Dalej jak dotad: updateMeshConnection STAT=2 -> PlayerStateChange(4) + JoinCompleted.

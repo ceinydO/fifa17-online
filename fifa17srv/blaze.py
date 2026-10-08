@@ -1125,7 +1125,13 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(Reply, msg_num={msg_num})")
 
                     other_list = list(other_names)
-                    _GAMES[game_id] = {"host": host_name, "players": [host_name] + other_list}
+                    faithful = cfg.gm_faithful_flow
+                    # faithful: w grze jest na poczatku tylko host (stan CONNECTED), zapraszani dolaczaja
+                    # dopiero po finalizeGameCreation hosta (jak w prawdziwym Blaze: host inicjuje siec,
+                    # potem NotifyPlatformHostInitialized, potem dolaczajacy lacza sie z hostem).
+                    _GAMES[game_id] = {"host": host_name,
+                                       "players": [host_name] if faithful else [host_name] + other_list,
+                                       "pending": list(other_list) if faithful else []}
                     network_topology = _find_field(gmcd_v, "NTOP") or 130
                     echo = {"GSET": _find_field(gmcd_v, "GSET") or 0,
                             "PRES": _find_field(gmcd_v, "PRES") or 1,
@@ -1137,35 +1143,49 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             "CAP": _find_field(fields, "PCAP"),
                             "TIDS": _find_field(fields, "TIDS")}
 
-                    def make_setup(viewer: str, disc: int):
-                        """NotifyGameSetup widziany oczami gracza `viewer`: kazdy klient zna SIEBIE pod
-                        LOCAL_USER_ID, a pozostalych pod ich haszowanymi BlazeId (jak w lookupUsers)."""
+                    def player_entry(viewer: str, pname: str, slot: int, state: int):
+                        """ReplicatedGamePlayer `pname` widziany oczami `viewer` (kazdy klient zna SIEBIE
+                        pod LOCAL_USER_ID, a pozostalych pod ich haszowanymi BlazeId)."""
                         with _PLAYERS_LOCK:
-                            v_entry = _PLAYERS.get(viewer, {})
-                        v_ident = v_entry.get("identity") or identity
+                            v_ident = _PLAYERS.get(viewer, {}).get("identity") or identity
+                            p_info = _PLAYERS.get(pname, {})
+                        p_name, p_ext, p_blob, p_uid, p_pid = identity_for_persona(pname, v_ident)
+                        return build_replicated_game_player(
+                            p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
+                            p_info.get("peer_ip") or p_info.get("ip", 0), p_info.get("port", 0) or 3659,
+                            slot_id=slot, team_index=min(slot, 1), state=state)
+
+                    def make_setup(viewer: str, disc: int, names, game_state: int):
+                        """NotifyGameSetup widziany oczami gracza `viewer` dla graczy `names`."""
+                        with _PLAYERS_LOCK:
+                            v_ident = _PLAYERS.get(viewer, {}).get("identity") or identity
                         roster_v = []
-                        host_uid_v = LOCAL_USER_ID
-                        for slot, pname in enumerate([host_name] + other_list):
-                            p_name, p_ext, p_blob, p_uid, p_pid = identity_for_persona(pname, v_ident)
-                            with _PLAYERS_LOCK:
-                                p_info = _PLAYERS.get(pname, {})
-                            if pname == host_name:
-                                host_uid_v = p_uid
-                            roster_v.append(build_replicated_game_player(
-                                p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
-                                p_info.get("peer_ip") or p_info.get("ip", 0), p_info.get("port", 0) or 3659,
-                                slot_id=slot, team_index=min(slot, 1),
-                                state=cfg.gm_initial_player_state))
+                        for slot, pname in enumerate(names):
+                            if faithful:
+                                st = 4 if pname == host_name else 2
+                            else:
+                                st = cfg.gm_initial_player_state
+                            roster_v.append(player_entry(viewer, pname, slot, st))
+                        host_uid_v = identity_for_persona(host_name, v_ident)[3]
                         gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
                                                         max_players, proto_version, network_topology,
                                                         host_uid=host_uid_v, extra=echo,
-                                                        game_state=1 if cfg.gm_deferred_pregame else 130)
+                                                        game_state=game_state)
                         return roster_v, build_notify_game_setup(gd, roster_v, setup_reason_disc=disc)
 
-                    invited = list(other_list)
-                    host_roster, host_frame = make_setup(host_name, 0)
+                    _GAMES[game_id]["make_setup"] = make_setup
+                    _GAMES[game_id]["player_entry"] = player_entry
+                    init_state = 1 if cfg.gm_deferred_pregame else 130
+                    invited = [] if faithful else list(other_list)
+                    host_names = [host_name] if faithful else [host_name] + other_list
+                    host_roster, host_frame = make_setup(host_name, 0, host_names, init_state)
                     extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)", host_frame))
-                    if cfg.gm_send_player_joining:
+                    if faithful:
+                        cap.note(f"-> tryb faithful: zapraszani ({other_list}) dolacza po finalizeGameCreation hosta")
+                        if not cfg.gm_deferred_pregame:
+                            extras.append(("NotifyGameStateChange PRE_GAME",
+                                           build_notify_game_state_change(game_id)))
+                    elif cfg.gm_send_player_joining:
                         # host dowiaduje sie o dolaczajacym graczu (jak w prawdziwym flow joinGame)
                         for pl in host_roster[1:]:
                             extras.append(("NotifyPlayerJoining [0x0004::0x0015]",
@@ -1173,17 +1193,17 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     invited_rosters = {}
                     if invited:
                         for other_name in invited:
-                            inv_roster, frame = make_setup(other_name, 2)
+                            inv_roster, frame = make_setup(other_name, 2, [host_name] + other_list, init_state)
                             invited_rosters[other_name] = inv_roster
                             if not _send_frame(other_name, frame, cap,
                                                "NotifyGameSetup [0x0004::0x0014] "
                                                "(zaproszony, IndirectJoinGameSetupContext)"):
                                 cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {other_name!r} "
                                          f"(rozlaczony?)")
-                    else:
+                    elif not faithful:
                         cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
                     roster = host_roster
-                    if cfg.gm_followups:
+                    if cfg.gm_followups and not faithful:
                         followups = []
                         if cfg.gm_initial_player_state == 4:
                             followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
@@ -1224,6 +1244,27 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                     extras.append(("GameManager join-completed (do nadawcy)", fr))
                                 else:
                                     _send_frame(viewer, fr, cap, "GameManager join-completed")
+                    elif command == FINALIZE_GAME_CREATION_COMMAND and game.get("pending"):
+                        # tryb faithful: host zainicjowal siec -> PRE_GAME, potem dolaczaja zapraszani
+                        cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: PRE_GAME + dolaczenie "
+                                 f"{game['pending']} (tryb faithful)")
+                        if cfg.gm_deferred_pregame:
+                            extras.append(("NotifyGameStateChange PRE_GAME", build_notify_game_state_change(gid)))
+                        extras.append(("NotifyPlatformHostInitialized",
+                                       build_notify_platform_host_initialized(gid, LOCAL_USER_ID)))
+                        for inv in list(game["pending"]):
+                            names = game["players"] + [inv]
+                            _r, setup_frame = game["make_setup"](inv, 2, names, 130)
+                            if not _send_frame(inv, setup_frame, cap,
+                                               "NotifyGameSetup (zaproszony, po finalize)"):
+                                cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {inv!r}")
+                                continue
+                            _send_frame(inv, build_notify_platform_host_initialized(
+                                gid, _uid_seen_by(inv, game["host"])), cap, "NotifyPlatformHostInitialized")
+                            extras.append(("NotifyPlayerJoining [0x0004::0x0015]", build_notify_player_joining(
+                                gid, game["player_entry"](game["host"], inv, len(game["players"]), 2))))
+                            game["players"].append(inv)
+                        game["pending"] = []
                     elif command == FINALIZE_GAME_CREATION_COMMAND:
                         cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: "
                                  f"NotifyPlatformHostInitialized do {game['players']}")

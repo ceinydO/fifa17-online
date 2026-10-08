@@ -39,6 +39,11 @@ class Config:
     # Hipoteza (2026-10-08): gra startuje w GSTA=INITIALIZING(1) i dopiero po finalizeGameCreation
     # serwer przesuwa ja do PRE_GAME(130) (NotifyGameStateChange). False = PRE_GAME od razu (stare).
     gm_deferred_pregame: bool = True
+    # Realistyczny przebieg (2026-10-08): w createGame host dostaje setup tylko ze soba (stan CONNECTED);
+    # zaproszony dostaje NotifyGameSetup dopiero po finalizeGameCreation hosta (wraz z
+    # NotifyPlatformHostInitialized), a host dostaje wtedy NotifyPlayerJoining. False = stary przebieg
+    # (obaj od razu w setupie).
+    gm_faithful_flow: bool = True
 
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
