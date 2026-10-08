@@ -117,10 +117,21 @@ _GAMES_LOCK = threading.Lock()
 _next_game_id = [1]
 
 
-def _register_player(name: str, stream, send_lock: threading.Lock, identity=None) -> None:
+def _register_player(name: str, stream, send_lock: threading.Lock, identity=None, peer_ip: int = 0) -> None:
     with _PLAYERS_LOCK:
         _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0,
-                          "identity": identity}
+                          "identity": identity, "peer_ip": peer_ip}
+
+
+def _peer_ip_u32(addr) -> int:
+    """Adres IPv4 z ktorego klient polaczyl sie z serwerem (tu: adres Radmin VPN gracza) jako uint32;
+    0 dla loopbacku -- drugi gracz nie moze sie polaczyc z naszym 127.0.0.1/192.168.x.x z RPCS3."""
+    try:
+        packed = socket.inet_aton(addr[0])
+    except (OSError, TypeError, IndexError):
+        return 0
+    val = int.from_bytes(packed, "big")
+    return 0 if (val >> 24) == 127 else val
 
 
 def _unregister_player(name: str, stream) -> bool:
@@ -951,7 +962,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam LoginResponse [{cfg.login_groups or 'same flagi'}] (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                     identity = login_identity(fields)
-                    _register_player(identity[0], stream, send_lock, identity)
+                    _register_player(identity[0], stream, send_lock, identity, _peer_ip_u32(addr))
                     with _PLAYERS_LOCK:
                         cap.note(f"-> rejestr graczy po loginie {identity[0]!r}: {sorted(_PLAYERS)}")
                     if cfg.send_user_authenticated:
@@ -1078,7 +1089,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         host_info = _PLAYERS.get(host_name, {})
                         other_names = [n for n in _PLAYERS if n != host_name]
                         cap.note(f"-> createGame od {host_name!r}, rejestr graczy: {sorted(_PLAYERS)}")
-                    host_ip, host_port = host_info.get("ip", 0), host_info.get("port", 0)
+                    host_ip = host_info.get("peer_ip") or host_info.get("ip", 0)
+                    host_port = host_info.get("port", 0) or 3659
 
                     resp = build_create_game_response(component, command, msg_num, game_id)
                     cap.note(f"-> wysylam CreateGameResponse GID={game_id} dla {host_name!r} "
@@ -1113,7 +1125,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                 host_uid_v = p_uid
                             roster_v.append(build_replicated_game_player(
                                 p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
-                                p_info.get("ip", 0), p_info.get("port", 0),
+                                p_info.get("peer_ip") or p_info.get("ip", 0), p_info.get("port", 0) or 3659,
                                 slot_id=slot, team_index=min(slot, 1)))
                         gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
                                                         max_players, proto_version, network_topology,
