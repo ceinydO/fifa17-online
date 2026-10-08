@@ -25,6 +25,12 @@ class Config:
     # capture). If the game ignores it or refuses, switch to True.
     blaze_secure: bool = False
 
+    # EKSPERYMENT (2026-10-08): po NotifyGameSetup wyslij obu graczom dodatkowe powiadomienia
+    # GameManager (NotifyGamePlayerStateChange 0x74 dla kazdego gracza + NotifyGameStateChange 0x64),
+    # bo host po createGame nic juz nie wysyla i wisi na "Sending match invite...". Ksztalty z Impulsum14
+    # (FIFA14), niezweryfikowane na FIFA 17 -- dlatego da sie to wylaczyc w config.json.
+    gm_followups: bool = True
+
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
     cert_sig_hash: str = "sha256"  # "sha1" may be needed for very old TLS stacks

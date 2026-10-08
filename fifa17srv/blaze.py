@@ -507,6 +507,23 @@ def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc:
     return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
 
 
+NOTIFY_GAME_STATE_CHANGE = 0x0064
+NOTIFY_GAME_PLAYER_STATE_CHANGE = 0x0074
+
+
+def build_notify_game_state_change(game_id: int, state: int = 130) -> bytes:
+    """NotifyGameStateChange {GID, GSTA} (0x0004/0x0064), ksztalt z Impulsum14; 130 = PRE_GAME."""
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("GSTA", tdf.VARINT, state)])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_STATE_CHANGE, payload)
+
+
+def build_notify_game_player_state_change(game_id: int, persona_id: int, state: int = 4) -> bytes:
+    """NotifyGamePlayerStateChange {GID, PID, STAT} (0x0004/0x0074); 4 = ACTIVE_CONNECTED."""
+    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, persona_id),
+                          ("STAT", tdf.VARINT, state)])
+    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_PLAYER_STATE_CHANGE, payload)
+
+
 def build_create_game_response(component: int, command: int, msg_num: int, game_id: int) -> bytes:
     """CreateGameResponse {GID} -- JEDYNE pole, potwierdzone w Impulsum14 (GameManager/
     CreateGameResponse.cs: dokladnie jeden czlonek, mGameId/GID, UInt32)."""
@@ -1037,6 +1054,16 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                                          f"(rozlaczony?)")
                     else:
                         cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
+                    if cfg.gm_followups:
+                        followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
+                                      build_notify_game_player_state_change(game_id, pid))
+                                     for pid in [_find_field(p, "PID ") for p in roster]]
+                        followups.append(("NotifyGameStateChange [0x0004::0x0064] PRE_GAME",
+                                          build_notify_game_state_change(game_id)))
+                        extras.extend(followups)
+                        for other_name in invited:
+                            for label, frame in followups:
+                                _send_frame(other_name, frame, cap, label + " (zaproszony)")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
