@@ -477,23 +477,46 @@ def build_replicated_game_player(name: str, identity, uid: int, persona_id: int,
 
 
 def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_port: int,
-                                max_players: int, proto_version: str, network_topology: int = 130):
-    """Blaze::GameManager::ReplicatedGameData -- podzbior pol (reszta pomijana, klient dostaje
-    wartosci domyslne dla nieobecnych tagow, jak wszedzie indziej w tym module). Tagi potwierdzone
-    w Impulsum14 (GameManager/ReplicatedGameData.cs). GSTA=PRE_GAME(130) -- gra utworzona, czeka na
-    graczy, zanim przejdzie w IN_GAME(131) (GameState.cs). NTOP domyslnie
-    PEER_TO_PEER_FULL_MESH(130) (GameNetworkTopology.cs) -- echo wartosci klienta gdy podana."""
-    return [
+                                max_players: int, proto_version: str, network_topology: int = 130,
+                                host_uid: int = LOCAL_USER_ID, extra=None):
+    """Blaze::GameManager::ReplicatedGameData (Impulsum14 GameManager/ReplicatedGameData.cs).
+    GSTA=PRE_GAME(130), NTOP domyslnie PEER_TO_PEER_FULL_MESH(130).
+
+    THST/PHST (TopologyHostInfo/PlatformHostInfo {HPID, HSLT}) i HSES wskazuja kto jest hostem gry --
+    bez nich SDK nie wie czy lokalny gracz jest hostem i nie uruchamia tworzenia sieci P2P (to byl
+    brakujacy element, host stal na "Sending match invite..."). `extra` to slownik z ECHEM pol z
+    zadania createGame (ATTR, CRIT, PCAP->CAP, GSET, PRES, VOIP, QCAP, TIDS, GTYP) -- serwer EA
+    odsyla klientowi to, co klient podal."""
+    extra = extra or {}
+    host_info = [("HPID", tdf.VARINT, host_uid), ("HSLT", tdf.VARINT, 0)]
+    fields = [
+        ("ADMN", tdf.LIST, (tdf.VARINT, [host_uid])),
         ("GID ", tdf.VARINT, game_id),
         ("GNAM", tdf.STRING, game_name),
-        ("GSET", tdf.VARINT, 0),
+        ("GSET", tdf.VARINT, extra.get("GSET", 0)),
         ("GSTA", tdf.VARINT, 130),
-        ("GTYP", tdf.STRING, "gameType0"),
+        ("GTYP", tdf.STRING, extra.get("GTYP", "gameType0")),
         ("HNET", tdf.LIST, (tdf.UNION, [build_network_address_union(host_ip, host_port)])),
+        ("HSES", tdf.VARINT, host_uid),
         ("MCAP", tdf.VARINT, max_players),
+        ("NRES", tdf.VARINT, 0),
         ("NTOP", tdf.VARINT, network_topology),
+        ("PHST", tdf.STRUCT, host_info),
+        ("PRES", tdf.VARINT, extra.get("PRES", 1)),
+        ("QCAP", tdf.VARINT, extra.get("QCAP", 0)),
+        ("THST", tdf.STRUCT, host_info),
+        ("VOIP", tdf.VARINT, extra.get("VOIP", 2)),
         ("VSTR", tdf.STRING, proto_version),
     ]
+    if extra.get("ATTR") is not None:
+        fields.append(("ATTR", tdf.MAP, extra["ATTR"]))
+    if extra.get("CRIT") is not None:
+        fields.append(("CRIT", tdf.MAP, extra["CRIT"]))
+    if extra.get("CAP") is not None:
+        fields.append(("CAP ", tdf.LIST, extra["CAP"]))
+    if extra.get("TIDS") is not None:
+        fields.append(("TIDS", tdf.LIST, extra["TIDS"]))
+    return sorted(fields, key=lambda f: f[0])
 
 
 def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc: int = 0) -> bytes:
@@ -1056,8 +1079,19 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         invited.append(other_name)
 
                     network_topology = _find_field(gmcd_v, "NTOP") or 130
+                    echo = {"GSET": _find_field(gmcd_v, "GSET") or 0,
+                            "PRES": _find_field(gmcd_v, "PRES") or 1,
+                            "VOIP": _find_field(gmcd_v, "VOIP") or 2,
+                            "QCAP": _find_field(gmcd_v, "QCAP") or 0,
+                            "GTYP": _find_field(fields, "GTYP") or "gameType0",
+                            "ATTR": _find_field(gmcd_v, "ATTR"),
+                            "CRIT": _find_field(gmcd_v, "CRIT"),
+                            "CAP": _find_field(fields, "PCAP"),
+                            "TIDS": _find_field(fields, "TIDS")}
                     game_data = build_replicated_game_data(game_id, game_name, host_ip, host_port,
-                                                            max_players, proto_version, network_topology)
+                                                            max_players, proto_version, network_topology,
+                                                            host_uid=LOCAL_USER_ID if host_name == identity[0] else 0,
+                                                            extra=echo)
                     extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)",
                                     build_notify_game_setup(game_data, roster, setup_reason_disc=0)))
                     if invited:
