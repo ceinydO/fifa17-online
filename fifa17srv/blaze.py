@@ -122,9 +122,15 @@ def _register_player(name: str, stream, send_lock: threading.Lock) -> None:
         _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0}
 
 
-def _unregister_player(name: str) -> None:
+def _unregister_player(name: str, stream) -> bool:
+    """Usuwa gracza tylko jesli rejestr nadal wskazuje na TEN stream -- inaczej zamykajacy sie stary
+    watek skasowalby wpis swiezego polaczenia tego samego gracza (reconnect wyprzedza zamkniecie starego)."""
     with _PLAYERS_LOCK:
-        _PLAYERS.pop(name, None)
+        entry = _PLAYERS.get(name)
+        if entry is not None and entry["stream"] is stream:
+            del _PLAYERS[name]
+            return True
+        return False
 
 
 def _update_player_network(name: str, ip: int, port: int) -> None:
@@ -878,6 +884,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"{len(resp)-HDR_LEN}B payloadu")
                     identity = login_identity(fields)
                     _register_player(identity[0], stream, send_lock)
+                    with _PLAYERS_LOCK:
+                        cap.note(f"-> rejestr graczy po loginie {identity[0]!r}: {sorted(_PLAYERS)}")
                     if cfg.send_user_authenticated:
                         extras.append(("UserAuthenticated [0x7802::0x0008]", build_user_authenticated(identity)))
                     extras.append(("NotifyUserAdded [0x7802::0x0002]", build_user_added(identity)))
@@ -991,6 +999,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     with _PLAYERS_LOCK:
                         host_info = _PLAYERS.get(host_name, {})
                         other_names = [n for n in _PLAYERS if n != host_name]
+                        cap.note(f"-> createGame od {host_name!r}, rejestr graczy: {sorted(_PLAYERS)}")
                     host_ip, host_port = host_info.get("ip", 0), host_info.get("port", 0)
 
                     resp = build_create_game_response(component, command, msg_num, game_id)
@@ -1047,7 +1056,9 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
     finally:
         try:
             if identity is not None:
-                _unregister_player(identity[0])
+                removed = _unregister_player(identity[0], stream)
+                cap.note(f"-> zamkniecie polaczenia gracza {identity[0]!r}: "
+                         f"{'usunieto z rejestru' if removed else 'wpis nalezy juz do nowszego polaczenia, zostaje'}")
         finally:
             try:
                 if stream is not None:
