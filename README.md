@@ -49,6 +49,15 @@ server changes has been run on a live client yet (only a local two-client simula
 how the game sends the actual invitation to the friend. Next step if the host still hangs: follow
 `TEST_PLAN.md`, then capture UDP 3659/9999 with Wireshark on the Radmin adapter.
 
+### Rejestracja przy kazdym starcie -- przyczyna i poprawka (2026-10-08)
+Z przechwytu: po loginie klient wysyla `Util::userSettingsLoad` (0x0009/0x000A) z kluczem `FirstTimeFlag`;
+pusta odpowiedz = "pierwsze logowanie" -> ekran powitalny/opt-in (`localizeStrings`, `getEmailOptInSettings`
+0x0001/0x00F2, `getAccount`, `updateAccount` 0x0014 z OPT1/OPT3), a na koncu klient zapisuje
+`userSettingsSave` (0x000B) `FirstTimeFlag='0'`. Serwer ignorowal zapis, wiec rejestracja wracala. Teraz
+`fifa17srv/usersettings.py` zapisuje ustawienia do `state/user_settings.json` (klucz = nazwa persony) i
+zwraca je w Load/LoadAll. Wylaczenie: `"persist_user_settings": false`. Po pierwszej rejestracji kolejne
+uruchomienia powinny ja pomijac. (Nie rozwiazuje to paska "EA servers not available" w rogu menu.)
+
 Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
 "Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".
 

@@ -47,6 +47,9 @@ class Config:
 
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
+    # trwale ustawienia uzytkownikow (Util::userSettings*), np. FirstTimeFlag -- zeby rejestracja nie wracala
+    state_dir: str = "state"
+    persist_user_settings: bool = True
     cert_sig_hash: str = "sha256"  # "sha1" may be needed for very old TLS stacks
     cert_send_chain: bool = True  # False sends only the leaf cert, not leaf+CA
     idle_timeout: float = 60.0
@@ -102,6 +105,10 @@ class Config:
     @property
     def log_dir_path(self) -> Path:
         return ROOT / self.log_dir
+
+    @property
+    def user_settings_path(self) -> Path:
+        return ROOT / self.state_dir / "user_settings.json"
 
 
 def load_config() -> Config:

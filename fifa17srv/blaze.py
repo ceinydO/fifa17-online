@@ -32,7 +32,7 @@ import ssl
 import threading
 import time
 
-from . import tdf
+from . import tdf, usersettings
 from .config import Config
 from .qos import QOS_PORT
 from .server import Capture, negotiate
@@ -45,6 +45,9 @@ PING_COMMAND = 0x0002
 FETCH_CLIENT_CONFIG_COMMAND = 0x0001
 AUTH_COMPONENT = 0x0001
 GET_ACCOUNT_COMMAND = 0x001E   # Authentication::getAccount -- nazwa z tabeli komend w EBOOT (0x00C778CC)
+USER_SETTINGS_LOAD_COMMAND = 0x000A      # Util::userSettingsLoad {KEY, UID} -> {DATA, KEY}
+USER_SETTINGS_SAVE_COMMAND = 0x000B      # Util::userSettingsSave {DATA, KEY, UID}
+USER_SETTINGS_LOAD_ALL_COMMAND = 0x000C  # Util::userSettingsLoadAll -> {SMAP}
 LOGIN_COMMAND = 0x000A      # Authentication: LoginRequest {AUTH, EXTB, EXTI} (odczytane z EBOOT: typ 0x025490A0)
 
 # Identyfikatory zwracane w LoginResponse (wartosci lokalne, wymyslone -- klient ma tylko dostac spojne liczby).
@@ -997,6 +1000,35 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         extras.append(("UserAuthenticated [0x7802::0x0008]", build_user_authenticated(identity)))
                     extras.append(("NotifyUserAdded [0x7802::0x0002]", build_user_added(identity)))
                     extras.append(("UserUpdated [0x7802::0x0005]", build_user_updated()))
+                elif (component == UTIL_COMPONENT and identity is not None and cfg.persist_user_settings
+                      and command in (USER_SETTINGS_LOAD_COMMAND, USER_SETTINGS_SAVE_COMMAND,
+                                      USER_SETTINGS_LOAD_ALL_COMMAND)):
+                    # Util::userSettingsLoad/Save/LoadAll -- trwale (plik JSON), klucz = nazwa persony.
+                    # Dzieki temu FirstTimeFlag='0' zapisany po "rejestracji" wraca przy nastepnym starcie.
+                    who = identity[0]
+                    key = _find_field(fields, "KEY") or ""
+                    if command == USER_SETTINGS_SAVE_COMMAND:
+                        val = _find_field(fields, "DATA")
+                        usersettings.put(cfg.user_settings_path, who, key, val if isinstance(val, str) else "")
+                        resp = build_reply(component, command, msg_num, b"")
+                        cap.note(f"-> userSettingsSave {who!r}: {key!r}={val!r} (zapisano na stale)")
+                    elif command == USER_SETTINGS_LOAD_COMMAND:
+                        val = usersettings.get(cfg.user_settings_path, who, key)
+                        if val is None:
+                            resp = build_reply(component, command, msg_num, b"")
+                            cap.note(f"-> userSettingsLoad {who!r}: {key!r} brak -> pusta odpowiedz")
+                        else:
+                            resp = build_reply(component, command, msg_num, tdf.encode(
+                                [("DATA", tdf.STRING, val), ("KEY ", tdf.STRING, key)]))
+                            cap.note(f"-> userSettingsLoad {who!r}: {key!r} = {val!r} (z pliku)")
+                    else:
+                        allv = usersettings.get_all(cfg.user_settings_path, who)
+                        if allv:
+                            resp = build_reply(component, command, msg_num, tdf.encode(
+                                [("SMAP", tdf.MAP, (tdf.STRING, tdf.STRING, sorted(allv.items())))]))
+                        else:
+                            resp = build_reply(component, command, msg_num, b"")
+                        cap.note(f"-> userSettingsLoadAll {who!r}: {len(allv)} kluczy")
                 elif component == AUTH_COMPONENT and command == GET_ACCOUNT_COMMAND and identity is not None:
                     resp = build_get_account_response(component, command, msg_num, identity)
                     cap.note(f"-> wysylam GetAccountResponse (Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
