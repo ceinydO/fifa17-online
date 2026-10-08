@@ -1170,3 +1170,14 @@ createGame: host dostaje NotifyGameSetup tylko ze soba (stan CONNECTED, GSTA=INI
 finalizeGameCreation serwer wysyla hostowi PRE_GAME + PlatformHostInitialized, a zaproszonemu
 NotifyGameSetup (PRE_GAME, roster host+on, IndirectJoin) + PlatformHostInitialized; host dostaje
 NotifyPlayerJoining. Dalej jak dotad: updateMeshConnection STAT=2 -> PlayerStateChange(4) + JoinCompleted.
+
+### Wnioski z kolejnej analizy EBOOT (2026-10-08)
+- Konstruktor klasy Game (0xc58c3c) w stanie INITIALIZING(1), POST_GAME(132) i MIGRATING(133) tworzy
+  dodatkowy obiekt "hosta platformy" z PHST/THST, a w PRE_GAME(130) hosta topologii szuka w rosterze po
+  THST.HPID (czyli host MUSI byc w PROS pod tym samym PID co THST.HPID -- tak jest w naszej odpowiedzi).
+- `isHost` = (host topologii == lokalny gracz); lokalny gracz jest wiazany po BlazeId zalogowanego
+  uzytkownika, wiec PID hosta widziany przez hosta musi byc rowny jego wlasnemu BlazeId (LOCAL_USER_ID).
+- Kod FIFA (0xc4917x) ustawia zmienna 'gsid' (id gry) tylko w obsludze stanu INITIALIZING hosta, wiec
+  pominiecie tego stanu (stary wariant: PRE_GAME od razu) mogl cos psuc.
+- Gracze dolaczajacy do gry, ktora nie jest jeszcze w PRE_GAME..POST_GAME, trafiaja do
+  `Game::mDeferredJoiningPlayerMap` (odroczone) -- dlatego zaproszony dostaje setup dopiero po przejsciu do PRE_GAME.
