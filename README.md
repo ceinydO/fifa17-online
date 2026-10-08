@@ -58,6 +58,17 @@ pusta odpowiedz = "pierwsze logowanie" -> ekran powitalny/opt-in (`localizeStrin
 zwraca je w Load/LoadAll. Wylaczenie: `"persist_user_settings": false`. Po pierwszej rejestracji kolejne
 uruchomienia powinny ja pomijac. (Nie rozwiazuje to paska "EA servers not available" w rogu menu.)
 
+### Baner "...servers are unavailable at this time" -- hipoteza i eksperyment (2026-10-08)
+Zrzut ekranu: u gory przewija sie "...rs are unavailable at this time. Please try again late(r)", a kafel
+Catalogue mowi "Connect to the EAS FC servers". Z EBOOT: za to odpowiada `POWService` (klasa pod 0x2314c0,
+tick 0x236178) -- usluga EASFC/EASW po HTTP (naglowki `EASW-Session`, `EASW-Token`, `EASW-Nucleus-Persona`).
+Jej adres pochodzi z kluczy konfiguracji serwera `FIFA_POW_URL` / `FIFA_POW_CONTENT_SERVER_URL` (kod 0x232550);
+gdy ich brak, adres jest pusty -- dokladnie to widac w RPCS3 jako `DnsHook: DNS query for ` (pusta nazwa) po
+zalogowaniu. Serwer dodaje teraz te klucze do odpowiedzi fetchClientConfig i ma atrape HTTP na portach
+8094 / 8080 (`pow_stub.py`), ktora tylko NAGRYWA zadania (logs/captures/pow_*.txt). To jeszcze nie jest
+prawdziwa usluga -- celem jest poznanie protokolu. Wylaczenie: `"serve_pow_config": false`.
+(Mapa CONF w fetchClientConfig jest teraz sortowana po kluczu.)
+
 Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
 "Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".
 

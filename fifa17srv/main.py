@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 
-from . import __version__, blaze, nucleus, qos, redirector, telemetry_stub
+from . import __version__, blaze, nucleus, pow_stub, qos, redirector, telemetry_stub
 from .analyze import analyze_file
 from .certs import ensure_certs
 from .config import load_config
@@ -60,6 +60,15 @@ def cmd_run(args) -> int:
     # czeka na udana transakcje telemetrii zanim odpyta Stats (patrz docs/HANDOFF.md).
     tsrv = Server("telemetry", cfg.bind_address, cfg.telemetry_port,
                   lambda c, a: telemetry_stub.handle(c, a, cfg, ctx)).start()
+    pow_srvs = []
+    if cfg.serve_pow_config:
+        pow_srvs = [
+            Server("pow", cfg.bind_address, cfg.pow_port,
+                   lambda c, a: pow_stub.handle(c, a, cfg, "pow")).start(),
+            Server("pow-content", cfg.bind_address, cfg.pow_content_port,
+                   lambda c, a: pow_stub.handle(c, a, cfg, "pow_content")).start(),
+        ]
+        print(f"  pow (EASFC): {cfg.bind_address}:{cfg.pow_port} i :{cfg.pow_content_port} (atrapa, nagrywa zadania)")
     print(BANNER.format(ver=__version__, bind=cfg.bind_address, rport=rsrv.port, host=cfg.redirector_host,
                         bport=psrv.port, adv=cfg.blaze_advertise_host, secure=cfg.blaze_secure,
                         qport=qsrv.port, nport=nsrv.port, tport=tsrv.port, logs=cfg.log_dir_path))
@@ -73,6 +82,8 @@ def cmd_run(args) -> int:
         qsrv.stop()
         nsrv.stop()
         tsrv.stop()
+        for x in pow_srvs:
+            x.stop()
     return 0
 
 

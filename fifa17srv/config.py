@@ -45,6 +45,12 @@ class Config:
     # (obaj od razu w setupie).
     gm_faithful_flow: bool = True
 
+    # Usluga POW / EASFC (patrz pow_stub.py): serwer podaje klientowi adresy w konfiguracji
+    # FIFA_POW_URL / FIFA_POW_CONTENT_SERVER_URL i nasluchuje na tych portach (tylko nagrywa zadania).
+    serve_pow_config: bool = True
+    pow_port: int = 8094
+    pow_content_port: int = 8080
+
     cert_dir: str = "certs"
     log_dir: str = "logs/captures"
     # trwale ustawienia uzytkownikow (Util::userSettings*), np. FirstTimeFlag -- zeby rejestracja nie wracala

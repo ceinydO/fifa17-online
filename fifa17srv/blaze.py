@@ -876,7 +876,8 @@ def build_keepalive_reply(request_header: bytes) -> bytes:
 
 
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
-                              canary: bool = False, advertise_host: str = "127.0.0.1") -> bytes:
+                              canary: bool = False, advertise_host: str = "127.0.0.1",
+                              extra_items=None) -> bytes:
     """fetchClientConfig: top-level pole CONF = mapa string->string.
     Dla nieznanych identyfikatorow (OSDK_*) mapa jest pusta, tak jak w grid-leak/blaze.
 
@@ -909,6 +910,9 @@ def build_client_config_reply(component: int, command: int, msg_num: int, cfid: 
     else:
         items = []
     items = items + disable_fe_stage3_thread
+    if cfid != "IdentityParams" and extra_items:
+        items = items + list(extra_items)
+    items = sorted(items, key=lambda kv: kv[0])   # mapy TDF sa uporzadkowane po kluczu
     payload = tdf.encode([("CONF", tdf.MAP, (tdf.STRING, tdf.STRING, items))])
     return build_reply(component, command, msg_num, payload)
 
@@ -985,8 +989,16 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     for tag, t, v in fields:
                         if tag == "CFID":
                             cfid = v
+                    extra_items = []
+                    if cfg.serve_pow_config:
+                        # klucze konfiguracji serwera czytane przez POWService (EBOOT 0x232550); bez nich adres
+                        # uslugi jest pusty i gra pokazuje komunikat o niedostepnych serwerach
+                        extra_items = [
+                            ("FIFA_POW_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_port}"),
+                            ("FIFA_POW_CONTENT_SERVER_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_content_port}"),
+                        ]
                     resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts,
-                                                      cfg.blaze_advertise_host)
+                                                      cfg.blaze_advertise_host, extra_items)
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")
                 elif component == AUTH_COMPONENT and command == LOGIN_COMMAND:
                     resp = build_login_response(component, command, msg_num, fields, cfg.login_groups)
