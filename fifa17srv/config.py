@@ -54,6 +54,10 @@ class Config:
     # Gdy serwer ich nie poda, modul FUT buduje zle adresy ("ut/game/fifa17/..." -> DNS 'ut', "/messages"
     # -> DNS '') i te zapytania koncza sie bledem. Z tym przelacznikiem wskazuja na atrape pod pow_port.
     serve_fut_config: bool = True
+    # Statystyki sezonowe (Play Season): grupy H2HSeasonalPlay / H2HPreviousSeasonalPlay / CoopSeasonalPlay_StatGroup
+    # dostaja deskryptory statystyk i jeden wiersz wartosci dla gracza (EBOOT 0x507a84 sklada z nich dane sezonu;
+    # z pustymi listami klient nie wysyla zdarzenia SeasonalPlayDownloadSuccess i ekran sezonu zostaje pusty).
+    serve_seasonal_stats: bool = True
 
     # Util::postAuth / getTelemetryServer: adresy serwera ticker (gorny pasek) i telemetrii (patrz blaze.py).
     serve_post_auth: bool = True

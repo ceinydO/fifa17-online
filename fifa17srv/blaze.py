@@ -632,8 +632,38 @@ def _find_field(fields, tag):
     return None
 
 
-def _stats_async_fields(group_name: str, view_id: int):
-    stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, []))]
+# Nazwy statystyk czytane przez kod sezonu klienta (EBOOT 0x507a84, kolejnosc jak w kodzie). Klient mapuje
+# nazwa -> pozycja z deskryptorow w StatGroupResponse.STAT i bierze wartosci z EntityStats.STAT w tej samej kolejnosci.
+SEASONAL_STAT_GROUPS = ("H2HSeasonalPlay", "H2HPreviousSeasonalPlay", "CoopSeasonalPlay_StatGroup")
+SEASONAL_STAT_NAMES = (
+    "seasons titlesWon leaguesWon divsWon1 divsWon2 divsWon3 divsWon4 cupsWon1 cupsWon2 cupsWon3 cupsWon4 cupsWon5 "
+    "dblsWon1 dblsWon2 dblsWon3 dblsWon4 cupsElim1 cupsElim2 cupsElim3 cupsElim4 cupsElim5 promotions holds "
+    "relegations rankingPoints curDivision prevDivision maxDivision bestDivision bestPoints curSeasonMov "
+    "lastMatch0 lastMatch1 lastMatch2 lastMatch3 lastMatch4 lastMatch5 lastOpponent0 lastOpponent1 lastOpponent2 "
+    "lastOpponent3 lastOpponent4 lastOpponent5 seasonWins seasonLosses seasonTies gamesPlayed goals goalsAgainst "
+    "points projectedPts prevSeasonWins prevSeasonTies prevSeasonLosses prevPoints prevProjectedPts extraMatches "
+    "skill wins ties losses starLevel gamesPlayedToday gamesPlayedThisMonth lastPlayDate appliedReward "
+    "highscore countryCode accountcountry controls").split()
+# poczatkowa wartosc: nowy gracz zaczyna w najnizszej dywizji (NUM_DIV=10), reszta 0
+SEASONAL_STAT_DEFAULTS = {"curDivision": "10", "prevDivision": "10", "maxDivision": "10", "bestDivision": "10"}
+USER_ENTITY_TYPE = (30722, 1)   # ObjectType uzytkownika (komponent UserSessions 0x7802, typ 1)
+
+
+def _stat_desc(name: str):
+    return [("CATG", tdf.STRING, ""), ("DFLT", tdf.STRING, SEASONAL_STAT_DEFAULTS.get(name, "0")),
+            ("DRVD", tdf.VARINT, 0), ("FRMT", tdf.STRING, ""), ("KIND", tdf.STRING, ""),
+            ("LDSC", tdf.STRING, ""), ("META", tdf.STRING, ""), ("NAME", tdf.STRING, name),
+            ("SDSC", tdf.STRING, ""), ("TYPE", tdf.VARINT, 0)]
+
+
+def _stats_async_fields(group_name: str, view_id: int, entity_ids=None):
+    entity_rows = []
+    if entity_ids and group_name in SEASONAL_STAT_GROUPS:
+        values = [SEASONAL_STAT_DEFAULTS.get(n, "0") for n in SEASONAL_STAT_NAMES]
+        for eid in entity_ids:
+            entity_rows.append([("EID ", tdf.VARINT, eid), ("ETYP", tdf.OBJTYPE, USER_ENTITY_TYPE),
+                                ("POFF", tdf.VARINT, 0), ("STAT", tdf.LIST, (tdf.STRING, values))])
+    stat_values = [("AGGR", tdf.LIST, (tdf.STRUCT, [])), ("STAT", tdf.LIST, (tdf.STRUCT, entity_rows))]
     return [
         ("GRNM", tdf.STRING, group_name),
         ("KEY ", tdf.STRING, ""),
@@ -643,27 +673,28 @@ def _stats_async_fields(group_name: str, view_id: int):
     ]
 
 
-def build_stats_async_notification(group_name: str, view_id: int) -> bytes:
+def build_stats_async_notification(group_name: str, view_id: int, entity_ids=None) -> bytes:
     """Blaze::Stats::KeyScopedStatValues -- ladunek powiadomienia GetStatsAsyncNotification (0x0007/0x0032),
     ksztalt potwierdzony w Impulsum14 (Blaze3SDK/Blaze/Stats/KeyScopedStatValues.cs + StatValues.cs).
     Klient wysyla getStatsByGroupAsync (0x0007/0x0010) i dostaje na nie PUSTA odpowiedz Reply -- prawdziwe
     dane (tu: pusta lista statystyk, bo nie mamy zadnych realnych danych sezonu) przychodza AS YNC jako ta
     notyfikacja. LAST=1 sygnalizuje klientowi koniec strumienia (brak kolejnych paczek)."""
-    payload = tdf.encode(_stats_async_fields(group_name, view_id))
+    payload = tdf.encode(_stats_async_fields(group_name, view_id, entity_ids))
     return build_notification(STATS_COMPONENT, GET_STATS_ASYNC_NOTIFICATION, payload)
 
 
 def build_stats_by_group_async_reply(component: int, command: int, msg_num: int,
-                                      group_name: str, view_id: int) -> bytes:
+                                      group_name: str, view_id: int, entity_ids=None) -> bytes:
     """EKSPERYMENT (2026-09-26): odpowiedz Reply na getStatsByGroupAsync (0x0007/0x0010) z tymi samymi
     danymi co GetStatsAsyncNotification, zamiast pustego Reply. Log pokazuje ze klient po dotychczasowej
     parze (pusty Reply + notification) po prostu milknie i zawiesza sie (baner RE-CONNECT po ~1s) -- test
     czy oczekuje danych synchronicznie w samym Reply, a nie tylko async w osobnej notyfikacji."""
-    payload = tdf.encode(_stats_async_fields(group_name, view_id))
+    payload = tdf.encode(_stats_async_fields(group_name, view_id, entity_ids))
     return build_reply(component, command, msg_num, payload)
 
 
-def build_stat_group_response(component: int, command: int, msg_num: int, group_name: str) -> bytes:
+def build_stat_group_response(component: int, command: int, msg_num: int, group_name: str,
+                             with_stats: bool = False) -> bytes:
     """Blaze::Stats::StatGroupResponse -- odpowiedz na getStatGroup (0x0007/0x0004), ksztalt potwierdzony
     w Impulsum14 (Blaze3SDK/Blaze/Stats/StatGroupResponse.cs). Pusta lista StatDescs -- nie mamy zadnych
     prawdziwych definicji statystyk, wysylamy tylko szkielet z poprawna nazwa grupy, zeby klient mial co
@@ -671,11 +702,11 @@ def build_stat_group_response(component: int, command: int, msg_num: int, group_
     fields = [
         ("CNAM", tdf.STRING, ""),
         ("DESC", tdf.STRING, ""),
-        ("ETYP", tdf.OBJTYPE, (0, 0)),
+        ("ETYP", tdf.OBJTYPE, USER_ENTITY_TYPE if with_stats else (0, 0)),
         ("KSUM", tdf.MAP, (tdf.STRING, tdf.VARINT, [])),
         ("META", tdf.STRING, ""),
         ("NAME", tdf.STRING, group_name),
-        ("STAT", tdf.LIST, (tdf.STRUCT, [])),
+        ("STAT", tdf.LIST, (tdf.STRUCT, [_stat_desc(n) for n in SEASONAL_STAT_NAMES] if with_stats else [])),
     ]
     payload = tdf.encode(fields)
     return build_reply(component, command, msg_num, payload)
@@ -1190,26 +1221,33 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         if tag == "NAME":
                             group_name = v
                     last_stat_group = group_name
-                    resp = build_stat_group_response(component, command, msg_num, group_name)
-                    cap.note(f"-> wysylam Stats::StatGroupResponse dla grupy={group_name!r} "
+                    seasonal = cfg.serve_seasonal_stats and group_name in SEASONAL_STAT_GROUPS
+                    resp = build_stat_group_response(component, command, msg_num, group_name, seasonal)
+                    extra = f" [{len(SEASONAL_STAT_NAMES)} deskryptorow statystyk sezonu]" if seasonal else ""
+                    cap.note(f"-> wysylam Stats::StatGroupResponse dla grupy={group_name!r}{extra} "
                              f"(Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_KEY_SCOPES_MAP_COMMAND:
                     resp = build_key_scopes_response(component, command, msg_num)
                     cap.note(f"-> wysylam Stats::KeyScopes (pusta mapa KSIT, Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == STATS_COMPONENT and command == GET_STATS_BY_GROUP_ASYNC_COMMAND:
-                    group_name, view_id = last_stat_group, 0
+                    group_name, view_id, entity_ids = last_stat_group, 0, []
                     for tag, t, v in fields:
                         if tag == "NAME" and v:
                             group_name = v
                         elif tag == "VID":
                             view_id = v
-                    resp = build_stats_by_group_async_reply(component, command, msg_num, group_name, view_id)
+                        elif tag == "EID":
+                            entity_ids = list(v[1] if isinstance(v, tuple) else v)
+                    if not cfg.serve_seasonal_stats:
+                        entity_ids = []
+                    resp = build_stats_by_group_async_reply(component, command, msg_num, group_name, view_id,
+                                                            entity_ids)
                     cap.note(f"-> EKSPERYMENT: odpowiadam na Stats::getStatsByGroupAsync danymi w Reply "
                              f"(nie pusto, msg_num={msg_num}), grupa={group_name!r} "
                              f"(z ostatniego getStatGroup), {len(resp)-HDR_LEN}B payloadu")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
-                                    build_stats_async_notification(group_name, view_id)))
+                                    build_stats_async_notification(group_name, view_id, entity_ids)))
                 elif (component == GAME_MANAGER_COMPONENT and command == CREATE_GAME_COMMAND
                       and identity is not None):
                     # GameManager::createGame -- KLIENT WYSYLA TO PO KLIKNIECIU "Play Match", SERWER

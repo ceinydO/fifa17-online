@@ -25,3 +25,9 @@ czy host/kolega w ogole wysyla pakiety do siebie po NotifyGameSetup?
 3. Sprawdz, czy baner sie zmienil. Przeslij: log serwera i pliki `logs/captures/pow_*.txt` (co FUT zadal).
 4. Opcjonalnie (tylko kosmetyka): patch `tools/rpcs3_patch_easfc_banner.yml` -- instrukcja w pliku.
    Wylaczenie nowych kluczy w serwerze: `"serve_fut_config": false`.
+
+## Play Season (test po zmianie `serve_seasonal_stats`)
+1. `git pull` + `.\update_and_run.ps1`, wejdz w Play Season i odczekaj ~20 s.
+2. Wyslij log serwera od "H2HSeasonalPlay": w logu ma byc `StatGroupResponse ... [70 deskryptorow statystyk sezonu]`
+   i potem NOWE zadania (kolejna grupa statystyk albo `fetchClientConfig CFID='FIFA_H2H_SEASONALPLAY'`) -- to znaczy, ze ruszylo.
+3. Jesli nadal cisza: `logs/captures/blaze_*.txt` + log RPCS3 (od momentu klikniecia).

@@ -123,6 +123,22 @@ klucz `PPU-1243af2b...` w `patch.yml` obok innych patchy, wlacz w Patch Managerz
 pusty pasek, daj znac (nastepny krok: dodatkowo wylaczyc odswiezanie widgetu). Nie zmienia ani nie naprawia
 samej uslugi POW.
 
+### Play Season: pusty ekran -- dane sezonu (2026-10-09, po tescie `5aa470a`)
+Test: baner bez zmian (POW nadal bez zadan), ale zapytanie `ut` zniklo i klient zadal
+`GET /fut/rs4/ut/game/fifa17/user/accountinfo` (FUT, Header `Easw-Session-Data-Nucleus-Id`) -- atrapa odpowiedziala `{}`.
+Play Season = pusty stadion + baner; w logu serwera po `getStatsByGroupAsync` dla `H2HSeasonalPlay` cisza.
+Z EBOT (potwierdzone w kodzie): ekran sezonu to sekwencja zadan (funkcja 0x6f95c8): [0] statystyki `H2HSeasonalPlay`,
+[1] `H2HPreviousSeasonalPlay`, ..., [3] konfiguracja `FIFA_H2H_SEASONALPLAY`. Funkcja 0x5086a8 wysyla zdarzenie
+`FE::FIFA::SeasonalPlayDownloadSuccess` **osobno dla kazdego wiersza encji** z wyniku Stats, a wartosci sklada z
+~65 statystyk po NAZWIE (0x507a84: seasons, curDivision, prevDivision, maxDivision, rankingPoints, seasonWins, ...).
+Nasze odpowiedzi mialy puste listy (brak deskryptorow `StatGroupResponse.STAT` i brak wiersza w `KeyScopedStatValues.STS.STAT`),
+wiec zdarzenie nie bylo nigdy wyslane i ekran czekal. **Zmiana (niezweryfikowana na kliencie):** `serve_seasonal_stats`
+(domyslnie wlaczone) -- dla grup `H2HSeasonalPlay`, `H2HPreviousSeasonalPlay`, `CoopSeasonalPlay_StatGroup` serwer odsyla
+deskryptory (70 nazw) i jeden wiersz dla EID gracza (wartosci "0", dywizje = "10"; ETYP=(30722,1) -- zgadniete).
+Nastepny krok: patrz log serwera -- jesli klient zada kolejnej grupy (`H2HPreviousSeasonalPlay`) albo
+`fetchClientConfig` z `CFID=FIFA_H2H_SEASONALPLAY` (klucze NUM_DIV, TOP_DIV, DIV_%d_NAME, PTS_WINS... z 0x4efe18), trzeba je obsluzyc.
+Wylaczenie: `"serve_seasonal_stats": false`. Baner "PRESS START" jest osobny (stan POW); patch: tools/rpcs3_patch_easfc_banner.yml.
+
 Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
 "Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".
 
