@@ -15,6 +15,46 @@ game itself.
 > source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
 > session (human or Claude) does not have to re-derive it from scratch.
 
+## Latest session: 2026-10-09 wieczor (pierwszy test na zywo po przebudowie GameManager)
+
+**Wynik testu (host `odyniec` + kolega `odyniec1`, Radmin, logi serwera i obu RPCS3):**
+- Logowanie, lookup persony, `listEntitlements`, `Messaging::fetchMessages/getMessages` i Stats dzialaja u obu.
+- Host wyslal `createGame` (PLJD: wlasny CGID `(30722,2,uid)` odeslany poprawnie, zarezerwowany kolega z
+  unikalnym uid) -> serwer odpowiedzial `CreateGameResponse GID=1` + `NotifyGameSetup` (DLSC/CREATE, GSTA=1,
+  host STAT=2). Klient hosta po tym zbindowal UDP **3659 i 9999** (czyli zaczal tworzyc siec gry), ale
+  **NIE wyslal ani `updateMeshConnection`, ani `finalizeGameCreation`** i nie wywolal `sceNpBasicSendMessageGui`;
+  po ok. minucie uzytkownik zamknal emulator. Kolega nie dostal nic (zaproszony dolacza dopiero po finalize).
+- **To jest REGRESJA wzgledem ostatniego testu na zywo (commit 2c9842c):** tam ten sam lancuch dochodzil do
+  `finalizeGameCreation`. Stary setup mial GSTA=130 (PRE_GAME), obu graczy z STAT=4, REAS nieustawiona (zly tag
+  VALU = unia pusta) oraz osobne `GamePlayerStateChange` x2 + `GameStateChange`. Nowy ma GSTA=1, tylko hosta ze
+  STAT=2, REAS=DLSC i brak follow-upow.
+
+**Co ustalila dekompilacja w tej sesji (adresy w EBOOT FIFA 17 PS3):**
+- `0xc6e0b8` = handler NotifyGameSetup: znajduje zadanie createGame po (indeks uzytkownika, GID), tworzy `Game`
+  (`0xc69ed0` -> ctor `0xc58c3c`), potem `0xc6dad8` -> `0xc60028` odpala tworzenie sieci gry. Wynik sieci wraca do
+  `0xc6a92c` (onNetworkCreated) -> `0xc6a4e0`, ktore dla hosta wysyla `finalizeGameCreation` (`0xc6a204`), a dla
+  dolaczajacego `updateMeshConnection STAT=2` (`0xc59f14`). `updateMeshConnection` hosta nie wysyla.
+- Odpowiedz na finalize (`0xc6bf74`) konczy zadanie createGame sukcesem, gdy `0xc5b8c0` zwroci prawde
+  (dla REAS nieustawionej i DLSC z DCTX!=3 -- tak). Dopiero wtedy FE moze wyslac zaproszenie.
+- Wysylka zaproszenia (`0x302454`) wymaga biezacej sesji w komponencie `gses`; bez niej zwraca blad bez wywolania
+  `sceNpBasicSendMessageGui`. Kod FIFA ustawia id gry dla hosta w obsludze stanu INITIALIZING, wiec sam stary
+  przebieg (od razu PRE_GAME) mogl dojsc do konca createGame, ale nie do zaproszenia.
+- `isHost` w `Game` = (BlazeId z THST/PHST.HPID == BlazeId zalogowanego uzytkownika z listy lokalnych graczy);
+  `vtable[0x28]` gry zwraca id hosta topologii (`Game+0x1b8`), a handler NotifyGameSetup wraca bez dzialania, gdy to 0.
+- Obserwacja: naglowek `Easw-Session-Data-Nucleus-Id` (POW, `0x51c1e4`) mial u hosta id KOLEGI (2028699422), u kolegi
+  jego wlasne. FIFA pobiera je z innego kontenera uzytkownikow niz lista graczy lokalnych (hipoteza: pierwszy/min id).
+  Nie wplywa na GameManager (tam porownanie idzie po liscie lokalnych), ale warto pamietac przy FUT/POW.
+
+**Zmiana w serwerze (niezweryfikowana, kolejny test):** warianty pierwszego `NotifyGameSetup` hosta
+(`gamemgr.VARIANTS`, przelacznik `gm_variant`, domyslnie 0 = auto):
+1. `init-connected`: INITIALIZING + host STAT=4, zaproszony po finalize (domyslny start);
+2. `pregame-connected`: PRE_GAME + host STAT=4 + follow-upy `GamePlayerStateChange`/`GameStateChange`;
+3. `legacy-both`: jak stary przebieg (PRE_GAME, pelny roster od razu, REAS nieustawiona, follow-upy);
+4. `init-connecting`: wariant z testu, po ktorym host stanal (tylko do porownan, `gm_variant=4`).
+Tryb auto: jesli poprzednia proba hosta NIE doszla do `finalizeGameCreation`, kolejny `createGame` uzywa
+nastepnego wariantu (1->2->3->1), a wariant, ktory doszedl, zostaje; stan w `state/gm_variant.json`. W logu serwera:
+linia `WARIANT n (nazwa)` po `createGame` i `WATCHDOG` po 10 s (OK / brak finalize). Selftest 37/37.
+
 ## Latest session: 2026-10-09 (analiza dekompilatorem, przebudowa GameManager)
 
 Dekompilacja EBOOT (Ghidra headless) pokazala konkretne bledy naszych odpowiedzi GameManager; wszystkie

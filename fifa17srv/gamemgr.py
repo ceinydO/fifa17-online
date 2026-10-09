@@ -18,6 +18,8 @@ Modul nie dotyka gniazd: funkcje zwracaja liste (gracz_docelowy, opis, ramka) do
 """
 from __future__ import annotations
 
+import json
+import os
 import random
 import threading
 import time
@@ -76,6 +78,104 @@ Out = tuple  # (nazwa_gracza, opis, ramka)
 # uzytkownikow SDK) musi znac gracza z rostera zanim dostanie NotifyGameSetup/NotifyPlayerJoining -- inaczej
 # szukanie uzytkownika po BlazeId zwraca NULL (patrz historia crasha lookupUsersByPersonaNames).
 USER_ADDED_BUILDER = None
+
+# ------------------------------------------------------------------------------------------------ warianty
+# Wariant = ksztalt PIERWSZEGO NotifyGameSetup dla hosta. Test na zywo 2026-10-09 pokazal, ze po przebudowie
+# (INITIALIZING + host ACTIVE_CONNECTING) klient hosta po NotifyGameSetup binduje UDP 3659/9999, ale nie wysyla
+# ani updateMeshConnection, ani finalizeGameCreation, podczas gdy stary przebieg (PRE_GAME, host ACTIVE_CONNECTED,
+# do tego GamePlayerStateChange + GameStateChange) wysylal oba. Dekompilacja (handler NotifyGameSetup 0xc6e0b8,
+# callback sieci 0xc6a92c -> 0xc6a4e0 -> finalizeGameCreation 0xc6a204) nie rozstrzyga, ktora roznica wstrzymuje
+# lancuch, wiec serwer potrafi wyprobowac kolejne warianty (przelacznik gm_variant w config.py).
+VARIANTS = {
+    1: {"name": "init-connected", "state": STATE_INITIALIZING, "host_state": PLAYER_CONNECTED,
+        "invitee_in_setup": False, "followups": False, "reason_unset": False,
+        "about": "INITIALIZING + host ACTIVE_CONNECTED, zaproszony dopiero po finalizeGameCreation"},
+    2: {"name": "pregame-connected", "state": STATE_PRE_GAME, "host_state": PLAYER_CONNECTED,
+        "invitee_in_setup": False, "followups": True, "reason_unset": False,
+        "about": "PRE_GAME + host ACTIVE_CONNECTED + GamePlayerStateChange/GameStateChange, zaproszony po finalize"},
+    3: {"name": "legacy-both", "state": STATE_PRE_GAME, "host_state": PLAYER_CONNECTED,
+        "invitee_in_setup": True, "followups": True, "reason_unset": True,
+        "about": "jak stary przebieg: PRE_GAME, obaj gracze od razu w setupie, REAS nieustawiona, follow-upy"},
+    4: {"name": "init-connecting", "state": STATE_INITIALIZING, "host_state": PLAYER_CONNECTING,
+        "invitee_in_setup": False, "followups": False, "reason_unset": False,
+        "about": "wariant z testu 2026-10-09, po ktorym host sie zatrzymal (do porownan)"},
+}
+AUTO_ROTATION = (1, 2, 3)
+_VARIANT_LOCK = threading.Lock()
+
+
+def _read_variant_state(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _write_variant_state(path, data) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, AttributeError):
+        pass
+
+
+def choose_variant(cfg):
+    """Wybiera wariant dla nowego createGame. Zwraca (numer | None, uzasadnienie). None = pojedyncze przelaczniki
+    (gm_variant = -1). Tryb auto (0): pierwszy raz wariant 1; jesli poprzednia proba nie doszla do
+    finalizeGameCreation -- nastepny z AUTO_ROTATION; jesli doszla -- ten sam."""
+    forced = getattr(cfg, "gm_variant", 0)
+    if forced < 0:
+        return None, "gm_variant=-1: pojedyncze przelaczniki gm_*"
+    if forced > 0:
+        number = forced if forced in VARIANTS else AUTO_ROTATION[0]
+        return number, f"wymuszony w config (gm_variant={forced})"
+    path = getattr(cfg, "gm_variant_path", None)
+    with _VARIANT_LOCK:
+        state = _read_variant_state(path) if path is not None else None
+        last = state.get("variant") if state else None
+        if last not in AUTO_ROTATION:
+            number, why = AUTO_ROTATION[0], "pierwsza proba"
+        elif state.get("finalized"):
+            number, why = last, f"poprzednia proba (wariant {last}) doszla do finalizeGameCreation -- zostaje"
+        else:
+            number = AUTO_ROTATION[(AUTO_ROTATION.index(last) + 1) % len(AUTO_ROTATION)]
+            why = f"poprzednia proba (wariant {last}) NIE doszla do finalizeGameCreation -- nastepny wariant"
+        if path is not None:
+            _write_variant_state(path, {"variant": number, "finalized": False})
+        return number, why
+
+
+def mark_finalized(cfg, number) -> None:
+    """Host wyslal finalizeGameCreation -- ten wariant 'dziala' (kolejny createGame zostanie przy nim)."""
+    path = getattr(cfg, "gm_variant_path", None)
+    if path is None or number not in AUTO_ROTATION:
+        return
+    with _VARIANT_LOCK:
+        state = _read_variant_state(path)
+        if state and state.get("variant") == number:
+            _write_variant_state(path, {"variant": number, "finalized": True})
+
+
+def effective_settings(cfg, number):
+    """Parametry pierwszego setupu: z wariantu albo z pojedynczych przelacznikow (number=None)."""
+    if number is None:
+        return {"name": "przelaczniki", "about": "pojedyncze przelaczniki gm_*",
+                "state": STATE_INITIALIZING if cfg.gm_deferred_pregame else STATE_PRE_GAME,
+                "host_state": cfg.gm_host_initial_state, "invitee_in_setup": not cfg.gm_faithful_flow,
+                "followups": False, "reason_unset": False}
+    return dict(VARIANTS.get(number, VARIANTS[AUTO_ROTATION[0]]))
+
+
+def attempt_info(gid: int):
+    """(numer wariantu, nazwa, czy host dotarl do finalizeGameCreation) lub None gdy gry nie ma."""
+    with GAMES_LOCK:
+        game = GAMES.get(gid)
+        if game is None:
+            return None
+        return game.get("variant"), game.get("variant_name"), bool(game.get("finalized"))
 
 
 def _user_added(lookup, subject: str):
@@ -311,9 +411,12 @@ def _snapshot(lookup, names):
 
 # ------------------------------------------------------------------------------------------- createGame
 def create_game(cfg, host: str, req_fields, others, lookup):
-    """Obsluga GameManager::createGame. Zwraca (gid, pola_odpowiedzi, [Out...])."""
+    """Obsluga GameManager::createGame. Zwraca (gid, pola_odpowiedzi, [Out...]); w grze zostaje zapisany
+    wariant ("variant", "variant_name") uzyty dla pierwszego NotifyGameSetup hosta."""
     gmcd = _field(req_fields, "GMCD", []) or []
     cmgd = _field(req_fields, "CMGD", []) or []
+    number, why = choose_variant(cfg)
+    eff = effective_settings(cfg, number)
     with GAMES_LOCK:
         gid = _next_game_id[0]
         _next_game_id[0] += 1
@@ -325,9 +428,11 @@ def create_game(cfg, host: str, req_fields, others, lookup):
             "max_players": _field(gmcd, "PMAX", 2) or 2, "min_players": _field(gmcd, "PMIN", 1) or 1,
             "topology": _field(gmcd, "NTOP", 130) or 130,
             "seed": random.getrandbits(31), "uuid": f"fifa17-{gid:08x}-{random.getrandbits(32):08x}",
-            "state": STATE_INITIALIZING if cfg.gm_deferred_pregame else STATE_PRE_GAME,
-            "players": [host], "pending": list(others) if cfg.gm_faithful_flow else [],
-            "pstate": {host: cfg.gm_host_initial_state}, "completed": set(),
+            "state": eff["state"],
+            "players": [host], "pending": [] if eff["invitee_in_setup"] else list(others),
+            "pstate": {host: eff["host_state"]}, "completed": set(),
+            "variant": number, "variant_name": eff["name"], "variant_why": why, "variant_about": eff["about"],
+            "finalized": False, "legacy_reason": eff["reason_unset"],
             "echo": {"GSET": _field(gmcd, "GSET", 0) or 0, "PRES": _field(gmcd, "PRES", 1) or 1,
                      "VOIP": _field(gmcd, "VOIP", 2) or 2, "QCAP": _field(gmcd, "QCAP", 0) or 0,
                      "GTYP": _field(req_fields, "GTYP", "") or "gameType0",
@@ -337,13 +442,34 @@ def create_game(cfg, host: str, req_fields, others, lookup):
         GAMES[gid] = game
         everybody = [host] + [n for n in others]
         players = _snapshot(lookup, everybody)
-        outs = [(host, "NotifyGameSetup [0x0004::0x0014] (host, DLSC/CREATE)",
-                 notify_game_setup(game, players, [host], setup_reason_dataless(cfg, DCTX_CREATE_GAME),
-                                   game["state"]))]
-        if not cfg.gm_faithful_flow:
-            # stary przebieg: zapraszani od razu w roster
-            game["pending"] = []
-            outs.extend(_join_players(cfg, game, list(others), lookup, send_platform_host=False))
+        reason = (tdf.UNION_UNSET, None) if eff["reason_unset"] else setup_reason_dataless(cfg, DCTX_CREATE_GAME)
+        reason_label = "REAS nieustawiona" if eff["reason_unset"] else "DLSC/CREATE"
+        if eff["invitee_in_setup"]:
+            # stary przebieg: roster od razu pelny (host + zapraszani, wszyscy w stanie hosta), kazdy dostaje setup
+            for j in others:
+                game["players"].append(j)
+                game["pstate"][j] = eff["host_state"]
+            outs = []
+            for me_, other in ((host, others), ) + tuple((j, [n for n in game["players"] if n != j]) for j in others):
+                for o in other:
+                    fr = _user_added(lookup, o)
+                    if fr is not None:
+                        outs.append((me_, f"NotifyUserAdded {o}", fr))
+                outs.append((me_, f"NotifyGameSetup [0x0004::0x0014] ({'host' if me_ == host else 'zaproszony'}, "
+                                  f"pelny roster, {reason_label})",
+                             notify_game_setup(game, players, game["players"], reason, game["state"])))
+        else:
+            outs = [(host, f"NotifyGameSetup [0x0004::0x0014] (host, {reason_label})",
+                     notify_game_setup(game, players, [host], reason, game["state"]))]
+        if eff["followups"]:
+            # jak w starym przebiegu: po setupie stany graczy i gry jeszcze raz jako osobne powiadomienia
+            snap = _snapshot(lookup, game["players"])
+            for target in game["players"]:
+                for n in game["players"]:
+                    outs.append((target, f"NotifyGamePlayerStateChange {n}={game['pstate'][n]}",
+                                 notify_player_state_change(gid, snap[n]["uid"], game["pstate"][n])))
+                outs.append((target, f"NotifyGameStateChange {game['state']}",
+                             notify_game_state_change(gid, game["state"])))
         return gid, create_game_response_fields(gid), outs
 
 
@@ -367,7 +493,10 @@ def _join_players(cfg, game: dict, joiners, lookup, send_platform_host: bool = T
             fr = _user_added(lookup, j)
             if fr is not None:
                 outs.append((other, f"NotifyUserAdded {j}", fr))
-        if context == "indirect" and getattr(cfg, "gm_indirect_join", True):
+        if game.get("legacy_reason") and context == "indirect":
+            reason = (tdf.UNION_UNSET, None)
+            label = "NotifyGameSetup (zaproszony, REAS nieustawiona)"
+        elif context == "indirect" and getattr(cfg, "gm_indirect_join", True):
             reason = setup_reason_indirect_join(cfg)
             label = "NotifyGameSetup (zaproszony, IJGS)"
         else:
@@ -379,7 +508,7 @@ def _join_players(cfg, game: dict, joiners, lookup, send_platform_host: bool = T
         if send_platform_host:
             outs.append((j, "NotifyPlatformHostInitialized",
                          notify_platform_host_initialized(game["id"], players[game["host"]]["uid"])))
-        if cfg.gm_send_player_joining:
+        if cfg.gm_send_player_joining and not game.get("legacy_reason"):
             entry = player_entry(players[j], game["id"], game["players"].index(j), game["pstate"][j],
                                  min(game["players"].index(j), 1))
             for other in game["players"]:
@@ -391,18 +520,21 @@ def _join_players(cfg, game: dict, joiners, lookup, send_platform_host: bool = T
 # ----------------------------------------------------------------------- finalizeGameCreation / mesh
 def finalize_game(cfg, name: str, req_fields, lookup) -> list:
     """UpdateGameSessionRequest (0x0F): host skonczyl inicjalizacje sieci -> PlatformHostInitialized,
-    stan gry INITIALIZING -> PRE_GAME, potem (tryb faithful) dolaczaja zapraszani."""
+    stan gry INITIALIZING -> PRE_GAME, potem (zaproszeni nie bedacy jeszcze w grze) dolaczaja."""
     gid = _field(req_fields, "GID", 0) or 0
     with GAMES_LOCK:
         game = GAMES.get(gid)
         if game is None:
             return []
+        if name == game["host"]:
+            game["finalized"] = True
+            mark_finalized(cfg, game.get("variant"))
         players = _snapshot(lookup, game["players"])
         host_uid = players[game["host"]]["uid"]
         outs = []
         for n in game["players"]:
             outs.append((n, "NotifyPlatformHostInitialized", notify_platform_host_initialized(gid, host_uid)))
-        if cfg.gm_deferred_pregame and game["state"] == STATE_INITIALIZING:
+        if game["state"] == STATE_INITIALIZING:
             game["state"] = STATE_PRE_GAME
             for n in game["players"]:
                 outs.append((n, "NotifyGameStateChange PRE_GAME", notify_game_state_change(gid, STATE_PRE_GAME)))

@@ -178,6 +178,29 @@ def _send_frame(name: str, frame: bytes, cap: Capture, label: str) -> bool:
         return False
 
 
+FINALIZE_WATCHDOG_SECONDS = 10.0
+
+
+def _start_finalize_watchdog(cap: Capture, gid: int, host: str) -> None:
+    """Po createGame sprawdza po chwili, czy host wyslal finalizeGameCreation; wynik tylko do logu (diagnostyka
+    wariantow z gamemgr.VARIANTS -- bez tego trzeba by czytac caly log, zeby zauwazyc, ze klient stanal)."""
+    def run():
+        time.sleep(FINALIZE_WATCHDOG_SECONDS)
+        info = gamemgr.attempt_info(gid)
+        if info is None:
+            return
+        try:
+            if info[2]:
+                cap.note(f"-> WATCHDOG: {host!r} GID={gid} wariant {info[0]} ({info[1]}): finalizeGameCreation OK")
+            else:
+                cap.note(f"-> WATCHDOG: {host!r} GID={gid} wariant {info[0]} ({info[1]}): po "
+                         f"{FINALIZE_WATCHDOG_SECONDS:.0f} s BRAK finalizeGameCreation -- klient hosta stoi; "
+                         f"kolejny createGame uzyje nastepnego wariantu (tryb auto)")
+        except Exception:                      # polaczenie hosta mogło juz zostac zamkniete
+            pass
+    threading.Thread(target=run, name=f"finalize-watchdog-{gid}", daemon=True).start()
+
+
 PERSONA_NAMESPACE = "cem_ea_id"
 DEFAULT_LOCALE = 1701724754        # 'enBR' -- taka wartosc klient wyslal w LANG w PreAuth
 AUTH_COMPONENT = 0x0001
@@ -1168,13 +1191,23 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             cap.note(f"-> createGame od {me!r}, rejestr graczy: {sorted(_PLAYERS)}")
                         gid, reply_fields, outs = gamemgr.create_game(cfg, me, fields, others, _lookup_player)
                         resp = build_reply_fields(component, command, msg_num, reply_fields)
+                        info = gamemgr.attempt_info(gid)
                         cap.note(f"-> wysylam CreateGameResponse GID={gid} dla {me!r} (Reply, msg_num={msg_num}); "
-                                 f"zapraszani po finalizeGameCreation: {others}")
+                                 f"zapraszani: {others}")
+                        if info is not None:
+                            with gamemgr.GAMES_LOCK:
+                                g = gamemgr.GAMES.get(gid, {})
+                                cap.note(f"-> WARIANT {info[0]} ({info[1]}): {g.get('variant_about')}; "
+                                         f"powod wyboru: {g.get('variant_why')}")
+                            _start_finalize_watchdog(cap, gid, me)
                     elif command == gamemgr.CMD_FINALIZE_GAME_CREATION:
                         resp = build_reply(component, command, msg_num, b"")
                         outs = gamemgr.finalize_game(cfg, me, fields, _lookup_player)
+                        info = gamemgr.attempt_info(_find_field(fields, "GID") or 0)
                         cap.note(f"-> finalizeGameCreation od {me!r} GID={_find_field(fields, 'GID')}: "
-                                 f"{len(outs)} powiadomien")
+                                 f"{len(outs)} powiadomien"
+                                 + (f" -- SUKCES wariantu {info[0]} ({info[1]}): klient hosta doszedl do konca "
+                                    f"tworzenia sieci gry" if info is not None and info[2] else ""))
                     elif command == gamemgr.CMD_UPDATE_MESH_CONNECTION:
                         resp = build_reply(component, command, msg_num, b"")
                         outs = gamemgr.update_mesh_connection(cfg, me, fields, _lookup_player)

@@ -38,3 +38,15 @@ i RPCS3 obu stron. W logu serwera szukaj: `finalizeGameCreation`, `updateMeshCon
 W RPCS3 hosta: czy pojawia sie `sceNpBasicSendMessageGui` (zaproszenie) i czy UDP 3659/9999 idzie miedzy PC.
 Przelaczniki (po jednym): `gm_fifa17_union_tags`, `gm_indirect_join`, `gm_host_initial_state` (4),
 `gm_faithful_flow`, `gm_deferred_pregame`, `serve_entitlements`, `serve_messaging`.
+
+## Test wariantow NotifyGameSetup (po testach 2026-10-09 22:26)
+Cel: ustalic, ktory ksztalt pierwszego setupu odblokowuje klienta hosta (patrz README, "pierwszy test na zywo").
+1. Host i kolega: `git pull`, host uruchamia `.\update_and_run.ps1` (serwer ma dzialac przez wszystkie proby).
+2. Host: Online Friendlies -> zaproszenie kolegi. Poczekaj ~15 s. W logu serwera szukaj linii
+   `WARIANT n (...)` i `WATCHDOG ... finalizeGameCreation OK` albo `BRAK finalizeGameCreation`.
+3. Jesli BRAK: zamknij gre/emulator hosta (SERWER ZOSTAJE WLACZONY), uruchom ponownie, wejdz w Online
+   Friendlies i zrob zaproszenie jeszcze raz -- serwer uzyje nastepnego wariantu. Tak do 3 prob.
+4. Jesli `finalizeGameCreation OK`: sprawdz w logu RPCS3 hosta `sceNpBasicSendMessageGui` (zaproszenie) i na
+   ekranie kolegi, czy cos sie pojawia. Przeslij wtedy logi (serwer, `logs/captures`, RPCS3 obu stron).
+Wymuszenie wariantu: `"gm_variant": 2` w `config.json` (1-4); `-1` = pojedyncze przelaczniki `gm_*`.
+Reset rotacji: usun `state/gm_variant.json`.

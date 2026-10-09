@@ -52,7 +52,7 @@ def _gamemgr_checks() -> None:
     """GameManager: przebieg create -> mesh -> finalize -> dolaczenie na syntetycznych graczach (bez gniazd)."""
     from . import gamemgr, ids
 
-    cfg = Config()
+    cfg = Config(state_dir=tempfile.mkdtemp(prefix="fifa17srv_gmstate_"))
     gamemgr.reset()
     reg = {
         "host": {"identity": ("host", 1, b"h" * 36), "ip": 1, "port": 3659, "peer_ip": 0x0A000001, "maci": 5},
@@ -85,6 +85,36 @@ def _gamemgr_checks() -> None:
                        ("TCG ", tdf.OBJID, ids.connection_group_objid_for("host"))], lookup)
     done = [o for o in mesh if o[1].startswith("NotifyPlayerJoinCompleted guest")]
     check("GameManager: mesh guest->host konczy dolaczanie gracza", len(done) >= 1)
+
+    # --- warianty pierwszego setupu (tryb auto, rotacja po nieudanej probie, wymuszenie)
+    def first_setup(cfg_, gid_outs):
+        gid_, _r, outs_ = gid_outs
+        host_setup = tdf.decode([o for o in outs_ if o[0] == "host" and o[2][8:10] == (0x14).to_bytes(2, "big")][0][2][16:])
+        d_ = dict((t, v) for t, _t, v in host_setup)
+        game_ = dict((t, v) for t, _t, v in d_["GAME"])
+        stat_ = dict((t, v) for t, _t, v in d_["PROS"][1][0])["STAT"]
+        return gid_, outs_, game_["GSTA"], stat_, d_["REAS"]
+
+    gamemgr.reset()
+    cfg2 = Config(state_dir=tempfile.mkdtemp(prefix="fifa17srv_gmstate_"))
+    g1, o1, gsta1, stat1, _ = first_setup(cfg2, gamemgr.create_game(cfg2, "host", req, ["guest"], lookup))
+    check("wariant auto #1: INITIALIZING + host CONNECTED, tylko host w setupie",
+          (gsta1, stat1) == (gamemgr.STATE_INITIALIZING, gamemgr.PLAYER_CONNECTED) and {o[0] for o in o1} == {"host"})
+    g2, o2, gsta2, stat2, _ = first_setup(cfg2, gamemgr.create_game(cfg2, "host", req, ["guest"], lookup))
+    check("wariant auto #2 po nieudanej probie: PRE_GAME + follow-upy (0x74, 0x64)",
+          gsta2 == gamemgr.STATE_PRE_GAME and any(o[1].startswith("NotifyGamePlayerStateChange") for o in o2)
+          and any(o[1].startswith("NotifyGameStateChange") for o in o2) and {o[0] for o in o2} == {"host"})
+    g3, o3, gsta3, stat3, reas3 = first_setup(cfg2, gamemgr.create_game(cfg2, "host", req, ["guest"], lookup))
+    check("wariant auto #3: jak stary przebieg (obaj w setupie, REAS nieustawiona)",
+          gsta3 == gamemgr.STATE_PRE_GAME and reas3[0] == tdf.UNION_UNSET and {o[0] for o in o3} == {"host", "guest"})
+    gamemgr.finalize_game(cfg2, "host", [("GID ", tdf.VARINT, g3)], lookup)
+    g4, o4, gsta4, stat4, reas4 = first_setup(cfg2, gamemgr.create_game(cfg2, "host", req, ["guest"], lookup))
+    check("wariant auto zostaje przy tym, ktory doszedl do finalizeGameCreation", reas4[0] == tdf.UNION_UNSET
+          and gamemgr.attempt_info(g4)[:2] == (3, "legacy-both"))
+    cfg3 = Config(state_dir=cfg2.state_dir, gm_variant=4)
+    g5, o5, gsta5, stat5, _ = first_setup(cfg3, gamemgr.create_game(cfg3, "host", req, ["guest"], lookup))
+    check("gm_variant=4 wymusza wariant z testu 2026-10-09 (INITIALIZING + host CONNECTING)",
+          (gsta5, stat5) == (gamemgr.STATE_INITIALIZING, gamemgr.PLAYER_CONNECTING))
     gamemgr.reset()
 
 

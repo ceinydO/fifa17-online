@@ -35,7 +35,16 @@ class Config:
     gm_faithful_flow: bool = True
     # Stan hosta w pierwszym NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient sam zglasza updateMeshConnection i
     # dopiero wtedy dostaje ACTIVE_CONNECTED + NotifyPlayerJoinCompleted), 4 = ACTIVE_CONNECTED od razu.
-    gm_host_initial_state: int = 2
+    # Test na zywo 2026-10-09: z wartoscia 2 (i INITIALIZING) host po NotifyGameSetup zbindowal UDP 3659/9999,
+    # ale NIE wyslal ani updateMeshConnection, ani finalizeGameCreation -- stary przebieg (PRE_GAME + host 4) wysylal.
+    gm_host_initial_state: int = 4
+    # Wariant pierwszego NotifyGameSetup dla hosta (patrz gamemgr.VARIANTS):
+    #   0  = automatycznie: zaczyna od wariantu 1; jesli poprzednia proba hosta NIE doszla do finalizeGameCreation,
+    #        kolejny createGame uzywa nastepnego wariantu (1 -> 2 -> 3 -> 1 ...); jesli doszla, wariant zostaje.
+    #        Stan trzymany w state/gm_variant.json (przetrwa restart serwera).
+    #   1..4 = wymuszony wariant, -1 = uzyj pojedynczych przelacznikow gm_deferred_pregame/gm_faithful_flow/
+    #        gm_host_initial_state z tego pliku.
+    gm_variant: int = 0
     # Stan dolaczajacego gracza po NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient laczy sie z hostem P2P).
     gm_initial_player_state: int = 2
     # NotifyPlayerJoining dla hosta o dolaczajacym graczu.
@@ -138,6 +147,10 @@ class Config:
     @property
     def user_settings_path(self) -> Path:
         return ROOT / self.state_dir / "user_settings.json"
+
+    @property
+    def gm_variant_path(self) -> Path:
+        return ROOT / self.state_dir / "gm_variant.json"
 
 
 def load_config() -> Config:
