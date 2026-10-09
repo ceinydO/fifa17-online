@@ -1,0 +1,23 @@
+# Opcjonalny patch RPCS3 (kosmetyczny): wylacza rysowanie banera "EAS FC servers are unavailable" /
+# "PRESS START TO RE-CONNECT" w rogu menu glownego.
+#
+# Jak uzyc: otworz plik patch.yml RPCS3 (folder patches), znajdz klucz
+#   PPU-1243af2b292938038cdc3696755e82477122db3b:
+# (ten sam, pod ktorym masz juz inne patche: CA swap, NEW_THREAD_FOR_FE_INIT_STAGE3, Nucleus URL),
+# i wklej PONIZSZY wpis POD TYM KLUCZEM (z zachowaniem wciec). Potem w RPCS3: Patch Manager ->
+# FIFA 17 -> BLES02233 v.01.00 -> zaznacz "EASFC corner banner off" -> uruchom gre od nowa.
+#
+# Co robi: na wejsciu funkcji SetStatus (VA 0x015CC554) wpisuje "blr" (0x4E800020), czyli funkcja
+# ustawiajaca tekst banera (TXT_EASFC_SERVER_ERROR / PLEASE_SIGN_IN / RECONNECTING) nic nie robi.
+# Funkcja nie ma jeszcze ramki stosu w pierwszej instrukcji (oryginal: mflr r0 = 0x7C0802A6), wiec
+# natychmiastowy powrot jest bezpieczny. Nie naprawia uslugi POW -- tylko ukrywa baner.
+
+  EASFC corner banner off:
+    Games:
+      FIFA 17:
+        BLES02233: [ "01.00" ]
+    Author: "custom"
+    Notes: "blr at 0x015CC554 (EASFC status banner setter) - banner text is never set"
+    Patch Version: "1.0"
+    Patch:
+          - [ be32, 0x015CC554, 0x4E800020 ]

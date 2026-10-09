@@ -65,14 +65,14 @@ def cmd_run(args) -> int:
         pow_srvs.append(Server("ticker", cfg.bind_address, cfg.ticker_port,
                                lambda c, a: tcp_record.handle(c, a, cfg, "ticker")).start())
         print(f"  ticker     : {cfg.bind_address}:{cfg.ticker_port} (atrapa, nagrywa)")
+    if cfg.serve_pow_config or cfg.serve_fut_config:
+        pow_srvs.append(Server("pow", cfg.bind_address, cfg.pow_port,
+                               lambda c, a: pow_stub.handle(c, a, cfg, "pow")).start())
+        print(f"  web (POW/FUT): {cfg.bind_address}:{cfg.pow_port} (atrapa, nagrywa zadania)")
     if cfg.serve_pow_config:
-        pow_srvs = [
-            Server("pow", cfg.bind_address, cfg.pow_port,
-                   lambda c, a: pow_stub.handle(c, a, cfg, "pow")).start(),
-            Server("pow-content", cfg.bind_address, cfg.pow_content_port,
-                   lambda c, a: pow_stub.handle(c, a, cfg, "pow_content")).start(),
-        ]
-        print(f"  pow (EASFC): {cfg.bind_address}:{cfg.pow_port} i :{cfg.pow_content_port} (atrapa, nagrywa zadania)")
+        pow_srvs.append(Server("pow-content", cfg.bind_address, cfg.pow_content_port,
+                               lambda c, a: pow_stub.handle(c, a, cfg, "pow_content")).start())
+        print(f"  pow content: {cfg.bind_address}:{cfg.pow_content_port} (atrapa, nagrywa zadania)")
     print(BANNER.format(ver=__version__, bind=cfg.bind_address, rport=rsrv.port, host=cfg.redirector_host,
                         bport=psrv.port, adv=cfg.blaze_advertise_host, secure=cfg.blaze_secure,
                         qport=qsrv.port, nport=nsrv.port, tport=tsrv.port, logs=cfg.log_dir_path))

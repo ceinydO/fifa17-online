@@ -929,6 +929,19 @@ OSDK_CORE_DEFAULTS = [
 ]
 
 
+def fut_config_items(host: str, port: int) -> list:
+    """Adresy uslug webowych modulu FUT (Ultimate Team), czytane przez funkcje po zalogowaniu
+    (EBOOT 0x4eab24: hasKey + getString, potem setBaseUrl na obiekcie FUT). Bez nich adresy sa puste:
+    URL = "" + "ut/game/fifa17/..." (host 'ut') i "" + "/messages" (host ''), czyli dokladnie te dwa
+    nieudane zapytania DNS widoczne w RPCS3.log tuz po zalogowaniu. FUT_RS4_BASE_URL musi konczyc sie
+    '/', bo kod dokleja "ut/game/%s/" bez separatora."""
+    web = f"http://{host}:{port}"
+    return [
+        ("FUT_RS4_BASE_URL", f"{web}/fut/rs4/"),
+        ("FUTDYNAMICMESSAGES_URL_BASE", f"{web}/fut/dynamicmessages"),
+    ]
+
+
 def build_client_config_reply(component: int, command: int, msg_num: int, cfid: str,
                               canary: bool = False, advertise_host: str = "127.0.0.1",
                               extra_items=None) -> bytes:
@@ -1051,6 +1064,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                             ("FIFA_POW_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_port}"),
                             ("FIFA_POW_CONTENT_SERVER_URL", f"http://{cfg.blaze_advertise_host}:{cfg.pow_content_port}"),
                         ]
+                    if cfg.serve_fut_config:
+                        extra_items += fut_config_items(cfg.blaze_advertise_host, cfg.pow_port)
                     resp = build_client_config_reply(component, command, msg_num, cfid, cfg.canary_hosts,
                                                       cfg.blaze_advertise_host, extra_items)
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")

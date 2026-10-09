@@ -1,11 +1,16 @@
-"""Atrapa uslugi POW / EASFC (EA SPORTS Football Club) -- tylko NAGRYWA zadania HTTP.
+"""Atrapa uslug webowych EASFC (POW) i FUT -- tylko NAGRYWA zadania HTTP.
 
-Z analizy EBOOT (2026-10-08): klasa POWService buduje adres z klucza konfiguracji serwera
-FIFA_POW_URL (domyslnie http://pas.gt.easfc.ea.com:8094) i FIFA_POW_CONTENT_SERVER_URL
-(domyslnie http://content.lt.easfc.ea.com:8080). Gdy serwer nie poda tych kluczy, adres jest pusty
-(RPCS3 loguje "DnsHook: DNS query for " z pusta nazwa) i gra pokazuje "...servers are unavailable".
-Ta atrapa przyjmuje polaczenia na tych portach, zapisuje pelne zadanie (metoda, sciezka, naglowki EASW-*,
-cialo) do logs/captures i odpowiada 200 z pustym JSON-em, zeby poznac protokol. Nie udaje prawdziwej uslugi.
+Z analizy EBOOT (2026-10-09):
+* POWService czyta FIFA_POW_URL / FIFA_POW_CONTENT_SERVER_URL (domyslnie http://pas.gt.easfc.ea.com:8094 i
+  http://content.lt.easfc.ea.com:8080), ale w RPCS3.log nie ma ani jednego zapytania POW (healthcheck
+  "pow/healthcheck/system/all") -- ani DNS, ani polaczenia na te porty. Powod nie jest ustalony.
+* Dwa nieudane zapytania DNS tuz po zalogowaniu ('' oraz 'ut') pochodza z modulu FUT: funkcja po
+  zalogowaniu (0x4eab24) przekazuje obiektowi FUT adresy z kluczy FUT_RS4_BASE_URL i
+  FUTDYNAMICMESSAGES_URL_BASE tylko gdy serwer je poda; bez nich URL = "ut/game/fifa17/..." (host 'ut')
+  i "/messages" (host '').
+Ta atrapa przyjmuje polaczenia pod pow_port / pow_content_port, zapisuje pelne zadanie (metoda, sciezka,
+naglowki, cialo) do logs/captures i odpowiada 200 z pustym JSON-em, zeby poznac protokol. Nie udaje
+prawdziwej uslugi.
 """
 from __future__ import annotations
 

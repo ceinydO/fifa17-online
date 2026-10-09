@@ -50,6 +50,10 @@ class Config:
     serve_pow_config: bool = True
     pow_port: int = 8094
     pow_content_port: int = 8080
+    # Klucze FUT_RS4_BASE_URL / FUTDYNAMICMESSAGES_URL_BASE (EBOOT 0x4eab24, funkcja po zalogowaniu).
+    # Gdy serwer ich nie poda, modul FUT buduje zle adresy ("ut/game/fifa17/..." -> DNS 'ut', "/messages"
+    # -> DNS '') i te zapytania koncza sie bledem. Z tym przelacznikiem wskazuja na atrape pod pow_port.
+    serve_fut_config: bool = True
 
     # Util::postAuth / getTelemetryServer: adresy serwera ticker (gorny pasek) i telemetrii (patrz blaze.py).
     serve_post_auth: bool = True

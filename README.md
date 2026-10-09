@@ -67,6 +67,8 @@ gdy ich brak, adres jest pusty -- dokladnie to widac w RPCS3 jako `DnsHook: DNS 
 zalogowaniu. Serwer dodaje teraz te klucze do odpowiedzi fetchClientConfig i ma atrape HTTP na portach
 8094 / 8080 (`pow_stub.py`), ktora tylko NAGRYWA zadania (logs/captures/pow_*.txt). To jeszcze nie jest
 prawdziwa usluga -- celem jest poznanie protokolu. Wylaczenie: `"serve_pow_config": false`.
+**Uwaga (2026-10-09): hipoteza "pusty adres POW = pusta nazwa w DNS" nie potwierdzila sie -- patrz
+sekcja ponizej.**
 (Mapa CONF w fetchClientConfig jest teraz sortowana po kluczu.)
 
 ### Baner EAS FC -- nowe ustalenia (2026-10-08, wieczor)
@@ -82,6 +84,44 @@ polaczeniu Blaze (RPCS3 zamyka je dopiero po wcisnieciu START). Odkrycia z EBOOT
   z fetchClientConfig. Dodano klucze OSDK_PEERBUFFERSIZE, OSDK_MAXGAMES, OSDK_MATCHUP_TIMEOUT itd.
 - Atrapa TCP na porcie 6776 (ticker) nagrywa, co klient wysyla (logs/captures/ticker_*.txt).
 Przelaczniki: `serve_post_auth`, `serve_osdk_core_defaults`, `serve_pow_config`.
+
+### Baner EAS FC -- analiza EBOOT i log z `postAuth` (2026-10-09)
+Test commita `47a874d` (postAuth + ticker + klucze OSDK): baner **bez zmian**, klient **nie polaczyl sie** z
+portem 6776 (ticker) ani 8094/8080 (POW). Hipotezy "ticker" i "POW URL" odpadaja jako przyczyna banera.
+
+**Potwierdzone w EBOOT (kod, nie zgadywanie):**
+- Baner w rogu to maszyna stanow `POWService` (EASFC). Funkcja `0x15cc554` (SetStatus) wybiera tekst z
+  tablicy {`TXT_EASFC_SERVER_ERROR`, `TXT_EASFC_PLEASE_SIGN_IN`, `TXT_EASFC_RECONNECTING`}; podtytul
+  `TXT_EASFC_RECONNECT_PROMPT` ("PRESS START TO RE-CONNECT") pojawia sie dopiero, gdy flaga `POW+0x2670`
+  jest ustawiona -- robi to tick POW (0x236178) po uplywie `POW_RECONNECT_TIMER_MS` (domyslnie 5000) **i tylko
+  gdy stan POW == 2**. Zgadza sie to z obserwacja "najpierw 'unavailable', po chwili 'press start'".
+- Stan POW (`+0x80`) = 2 ustawia wylacznie handler `0x239a7c` (slot vtable 0x214), wywolany z parametrami
+  (typ=1, powod in {1,2,7}) **gdy POW jest "online"** (stan 1 + `POW_IS_ON` + flaga `+0x84` ustawiana przez
+  `PowBlazeConnected`, wolane z funkcji po zalogowaniu 0x4eab24). Ten sam filtr ma handler UI `0x15ccbf8`.
+  **Nie ustalono jeszcze, kto wysyla to zdarzenie** (to glowna nieznana).
+- START wywoluje `POWService::PowReconnect` (komunikat "connecting to EA SPORTS Football Club").
+- W logu RPCS3 nie ma **zadnego** zapytania POW (ani DNS `pas.gt.easfc.ea.com`, ani polaczenia z naszym
+  8094) -- `pow/healthcheck/system/all` nie jest wysylany. Powod nieznany.
+- Dwa nieudane zapytania DNS po zalogowaniu: `ut` pochodzi z modulu FUT (kod 0x51d3f4 buduje
+  `<FUT_RS4_BASE_URL>` + `"ut/game/fifa17/"`, a baza jest ustawiana w 0x4eab24 **tylko gdy serwer poda klucz**
+  `FUT_RS4_BASE_URL`; bez niego URL zaczyna sie od `ut/...` i hostem jest `ut`). Zapytanie z **pusta** nazwa
+  hosta wypada tuz po utworzeniu katalogow `imgAssets/banners/fifahub` i `.../easfcnewsalerts` -- te
+  katalogi tworzy kod POW (0x2309dc / 0x230a0c), wiec to prawdopodobnie pobieranie bannerow/newsow POW z
+  pustym URL-em (nie potwierdzone, nie jest to `FIFA_POW_URL`).
+- Domysly `getString` przy braku klucza sa kopiowane do bufora (dowod: `PIN_SERVER` -> `pin-river.data.ea.com`
+  dziala na wartosci domyslnej).
+
+**Zmiana w serwerze (niezweryfikowana na zywym kliencie):** `serve_fut_config` (domyslnie wlaczone) dodaje do
+fetchClientConfig `FUT_RS4_BASE_URL` (`http://<host>:8094/fut/rs4/`, musi konczyc sie `/`) i
+`FUTDYNAMICMESSAGES_URL_BASE`; atrapa HTTP pod `pow_port` nagrywa zadania (logs/captures/pow_*.txt).
+Spodziewany efekt: zapytanie `ut` zamienia sie w prawdziwe polaczenie z naszym portem 8094 i zobaczymy, co FUT
+zadaje. Czy baner zniknie -- nie wiadomo.
+
+**Obejscie kosmetyczne (patch RPCS3, opcjonalny):** `tools/rpcs3_patch_easfc_banner.yml` -- jedno slowo,
+`blr` na wejsciu `SetStatus` (0x015CC554), wiec baner nigdy nie jest ustawiany. Wklej wpis pod ten sam
+klucz `PPU-1243af2b...` w `patch.yml` obok innych patchy, wlacz w Patch Managerze. Jesli po patchu zostanie
+pusty pasek, daj znac (nastepny krok: dodatkowo wylaczyc odswiezanie widgetu). Nie zmienia ani nie naprawia
+samej uslugi POW.
 
 Detailed notes (in Polish) are at the end of this file: "Eksperyment `gm_deferred_pregame`",
 "Poprawka ksztaltow powiadomien", "Przebieg `gm_faithful_flow`", "Wnioski z kolejnej analizy EBOOT".

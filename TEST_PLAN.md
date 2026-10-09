@@ -16,3 +16,12 @@ Zmieniaj po jednej rzeczy w `config.json` (sprawdz po kazdej zmianie):
 ## Diagnostyka sieci (jesli nadal nic)
 Wireshark na adapterze Radmin, filtr `udp.port == 3659 || udp.port == 9999`:
 czy host/kolega w ogole wysyla pakiety do siebie po NotifyGameSetup?
+
+## Baner "EAS FC servers are unavailable" (test 2026-10-09)
+1. `git pull` + `.\update_and_run.ps1`. W bannerze startowym powinna byc linia `web (POW/FUT): ...:8094`.
+   Zezwol Windows Firewall na port 8094 (i 8080, 6776 jesli kolega sie laczy).
+2. Wejdz do menu glownego. W logu RPCS3 szukaj `DnsHook: DNS query for ut` -- po tej zmianie ma zniknac
+   (zamiast tego `Attempting to connect on <adres Radmin>:8094`). Zapytanie z pusta nazwa moze zostac.
+3. Sprawdz, czy baner sie zmienil. Przeslij: log serwera i pliki `logs/captures/pow_*.txt` (co FUT zadal).
+4. Opcjonalnie (tylko kosmetyka): patch `tools/rpcs3_patch_easfc_banner.yml` -- instrukcja w pliku.
+   Wylaczenie nowych kluczy w serwerze: `"serve_fut_config": false`.
