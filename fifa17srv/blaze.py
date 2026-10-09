@@ -32,7 +32,7 @@ import ssl
 import threading
 import time
 
-from . import tdf, usersettings
+from . import gamemgr, ids, messaging, tdf, usersettings
 from .config import Config
 from .qos import QOS_PORT
 from .server import Capture, negotiate
@@ -46,6 +46,7 @@ FETCH_CLIENT_CONFIG_COMMAND = 0x0001
 AUTH_COMPONENT = 0x0001
 UTIL_GET_TELEMETRY_SERVER_COMMAND = 0x0005   # Util::getTelemetryServer {CMAC, SNAM}
 UTIL_POST_AUTH_COMMAND = 0x0008              # Util::postAuth {DSUI, MAC, UDID} -> {TELE, TICK, UROP}
+LIST_ENTITLEMENTS_COMMAND = 0x0020   # Authentication::listEntitlements {BUID, EPSN, EPSZ, FLAG, GNLS} -> Entitlements {NLST}
 GET_ACCOUNT_COMMAND = 0x001E   # Authentication::getAccount -- nazwa z tabeli komend w EBOOT (0x00C778CC)
 USER_SETTINGS_LOAD_COMMAND = 0x000A      # Util::userSettingsLoad {KEY, UID} -> {DATA, KEY}
 USER_SETTINGS_SAVE_COMMAND = 0x000B      # Util::userSettingsSave {DATA, KEY, UID}
@@ -108,8 +109,6 @@ _SEASON_ID_TAG_CANDIDATES = ("SEAS", "SNUM", "SIID", "CSID", "ID  ", "STAT")
 # na "Sending match invite and creating a game session"). createGame = method Id 1 (CreateGameRequest/
 # CreateGameResponse), NotifyGameSetup = notification Id 20 (0x14) -- oba potwierdzone w tym samym pliku.
 GAME_MANAGER_COMPONENT = 0x0004
-CREATE_GAME_COMMAND = 0x0001
-NOTIFY_GAME_SETUP = 0x0014
 
 # Rejestr polaczonych graczy (nazwa persony -> stream/lock/adres), potrzebny zeby createGame wywolane
 # w watku jednego gracza moglo wypchnac powiadomienie NotifyGameSetup do watku DRUGIEGO gracza --
@@ -118,13 +117,11 @@ NOTIFY_GAME_SETUP = 0x0014
 # ORAZ asynchroniczne powiadomienia wpychane z watku innego gracza), zeby ramki nigdy sie nie przeplotly.
 _PLAYERS_LOCK = threading.Lock()
 _PLAYERS: dict = {}   # nazwa persony -> {"stream", "send_lock", "ip", "port"}
-_GAMES_LOCK = threading.Lock()
-_next_game_id = [1]
 
 
 def _register_player(name: str, stream, send_lock: threading.Lock, identity=None, peer_ip: int = 0) -> None:
     with _PLAYERS_LOCK:
-        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0,
+        _PLAYERS[name] = {"stream": stream, "send_lock": send_lock, "ip": 0, "port": 0, "maci": 0,
                           "identity": identity, "peer_ip": peer_ip}
 
 
@@ -150,11 +147,18 @@ def _unregister_player(name: str, stream) -> bool:
         return False
 
 
-def _update_player_network(name: str, ip: int, port: int) -> None:
+def _update_player_network(name: str, ip: int, port: int, maci: int = 0) -> None:
     with _PLAYERS_LOCK:
         entry = _PLAYERS.get(name)
         if entry is not None:
-            entry["ip"], entry["port"] = ip, port
+            entry["ip"], entry["port"], entry["maci"] = ip, port, maci
+
+
+def _lookup_player(name: str):
+    """Kopia wpisu rejestru (bez gniazd) dla gamemgr -- None gdy gracz nie jest polaczony."""
+    with _PLAYERS_LOCK:
+        entry = _PLAYERS.get(name)
+        return None if entry is None else {k: v for k, v in entry.items() if k not in ("stream", "send_lock")}
 
 
 def _send_frame(name: str, frame: bytes, cap: Capture, label: str) -> bool:
@@ -254,8 +258,7 @@ def _persona_user_id(name: str) -> int:
     BlazeId, wiec np. lookupUsersByPersonaNames('playerA') wykonane przez sesje 'playerB' zwracalo
     wpis z tym samym ID co sesja playerB -- klient wykrywal sprzecznosc (ten sam BlazeId, inna nazwa
     persony niz wlasna) i padal (rozlaczenie ~10-20s po odpowiedzi)."""
-    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
-    return 2000000000 + (h % 1000000000)
+    return ids.uid_for(name)
 
 
 def identity_for_persona(name: str, own_identity):
@@ -276,22 +279,24 @@ def identity_for_persona(name: str, own_identity):
     ksztalt (bo to dokladnie to, co sam wyslal w swoim loginie), wiec nie powinien juz czytac poza
     buforem, nawet jesli tresc semantycznie nie nalezy do szukanej persony."""
     own_name, own_ext_id, own_blob = own_identity
+    uid = ids.uid_for(name)
     if name == own_name:
-        return name, own_ext_id, own_blob, LOCAL_USER_ID, LOCAL_PERSONA_ID
-    uid = _persona_user_id(name)
+        return name, own_ext_id, own_blob, uid, ids.persona_id_for(name)
     # Prawdziwy EXTI/EXTB (NpId) drugiego gracza znamy z jego loginu (rejestr) -- uzywamy go zamiast
     # kopii wlasnego, jesli ten gracz jest polaczony.
     with _PLAYERS_LOCK:
         entry = _PLAYERS.get(name)
     real = entry.get("identity") if entry else None
     if real is not None:
-        return name, real[1], real[2], uid, uid + 1
-    return name, own_ext_id, own_blob, uid, uid + 1
+        return name, real[1], real[2], uid, ids.persona_id_for(name)
+    return name, own_ext_id, own_blob, uid, ids.persona_id_for(name)
 
 
-def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
+def build_user_identification(identity, uid: int = None, persona_id: int = None):
     """Blaze::UserIdentification (9 pol, ksztalt potwierdzony w NotifyUserAdded z realnego ruchu)."""
     name, ext_id, blob = identity
+    uid = ids.uid_for(name) if uid is None else uid
+    persona_id = ids.persona_id_for(name) if persona_id is None else persona_id
     return [
         ("AID ", tdf.VARINT, uid),
         ("ALOC", tdf.VARINT, DEFAULT_LOCALE),
@@ -305,7 +310,7 @@ def build_user_identification(identity, uid: int = LOCAL_USER_ID, persona_id: in
     ]
 
 
-def build_user_added(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID) -> bytes:
+def build_user_added(identity, uid: int = None, persona_id: int = None) -> bytes:
     """NotifyUserAdded {DATA: UserSessionExtendedData, USER: UserIdentification} (0x7802/0x0002).
     Definicje pol odczytane z EBOOT. DATA zawiera tylko nieustawiona unie ADDR (jak w logach SDK innych gier)."""
     data = [("ADDR", tdf.UNION, (tdf.UNION_UNSET, None))]
@@ -313,7 +318,10 @@ def build_user_added(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_ADDED, payload)
 
 
-def build_user_data(identity, uid: int = LOCAL_USER_ID, persona_id: int = LOCAL_PERSONA_ID):
+gamemgr.USER_ADDED_BUILDER = lambda ident: build_user_added(ident)
+
+
+def build_user_data(identity, uid: int = None, persona_id: int = None):
     """Blaze::UserData {EDAT, FLGS, USER} (Impulsum14 UserData.cs; tagi EDAT/FLGS/USER potwierdzone tez
     w EBOOT: kolejne wpisy tabeli refleksji pod 0x254eb08). USER to zagniezdzona UserIdentification.
     Wczesniej wysylalismy plaska strukture EXBB/EXID/ID/NAME/NASP/FLGS -- wtedy klient nie wypelnial
@@ -395,10 +403,13 @@ def build_user_authenticated(identity) -> bytes:
     Pole CGID (ObjectId) pomijam: brakujace pola dekodowane sa jako wartosci domyslne."""
     name, ext_id, _blob = identity
     now = int(time.time())
+    uid = ids.uid_for(name)
     fields = [
         ("1CON", tdf.VARINT, 0),
         ("ALOC", tdf.VARINT, DEFAULT_LOCALE),
-        ("BUID", tdf.VARINT, LOCAL_USER_ID),
+        ("BUID", tdf.VARINT, uid),
+        # CGID = grupa polaczen tej sesji; ten sam numer widza inni gracze jako ReplicatedGamePlayer.CONG
+        ("CGID", tdf.OBJID, ids.connection_group_objid_for(name)),
         ("DSNM", tdf.STRING, name),
         ("FRST", tdf.VARINT, 0),
         ("KEY ", tdf.STRING, LOCAL_SESSION_KEY),
@@ -406,24 +417,24 @@ def build_user_authenticated(identity) -> bytes:
         ("LLOG", tdf.VARINT, now),
         ("MAIL", tdf.STRING, LOCAL_EMAIL),
         ("NASP", tdf.STRING, PERSONA_NAMESPACE),
-        ("PID ", tdf.VARINT, LOCAL_PERSONA_ID),
+        ("PID ", tdf.VARINT, ids.persona_id_for(name)),
         ("PLAT", tdf.VARINT, PLATFORM_PS3),
-        ("UID ", tdf.VARINT, LOCAL_USER_ID),
+        ("UID ", tdf.VARINT, uid),
         ("USTP", tdf.VARINT, 0),
         ("XREF", tdf.VARINT, ext_id),
     ]
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_AUTHENTICATED, tdf.encode(fields))
 
 
-def build_user_updated() -> bytes:
+def build_user_updated(identity) -> bytes:
     """UserSessions::UserUpdated (0x7802/0x0005), typ UserStatus {FLGS statusFlags, ID blazeId} -- definicja z EBOOT.
     W logu SDK od EA przychodzi tuz po UserAdded i niesie flagi stanu uzytkownika (online)."""
-    payload = tdf.encode([("FLGS", tdf.VARINT, USER_FLAG_ONLINE), ("ID  ", tdf.VARINT, LOCAL_USER_ID)])
+    payload = tdf.encode([("FLGS", tdf.VARINT, USER_FLAG_ONLINE), ("ID  ", tdf.VARINT, ids.uid_for(identity[0]))])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_UPDATED, payload)
 
 
 def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0, best_ping_site: str = "",
-                           dbps: int = 0, ubps: int = 0, natt: int = 0) -> bytes:
+                           dbps: int = 0, ubps: int = 0, natt: int = 0, uid: int = LOCAL_USER_ID) -> bytes:
     """UserSessionExtendedDataUpdate {DATA, SUBS, USID} (0x7802/0x0001).
 
     HIPOTEZA (2026-09-24): wczesniej ADDR bylo UNSET -- klient sam prosi o swoj adres w
@@ -448,186 +459,19 @@ def build_ext_data_update(ip: int = 0, maci: int = 0, port: int = 0, best_ping_s
         data.append(("BPS ", tdf.STRING, best_ping_site))
     qos_data = [("DBPS", tdf.VARINT, dbps), ("NATT", tdf.VARINT, natt), ("UBPS", tdf.VARINT, ubps)]
     data.append(("QDAT", tdf.STRUCT, qos_data))
-    payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, LOCAL_USER_ID)])
+    payload = tdf.encode([("DATA", tdf.STRUCT, data), ("SUBS", tdf.VARINT, 0), ("USID", tdf.VARINT, uid)])
     return build_notification(USER_SESSIONS_COMPONENT, NOTIFY_USER_SESSION_EXTENDED_DATA_UPDATE, payload)
 
 
-def build_ip_address(ip: int, port: int):
-    """Blaze::IpAddress {IP, PORT} -- ksztalt i tagi potwierdzone w Impulsum14 (Blaze/IpAddress.cs),
-    hash tagow zweryfikowany lokalnie (encode_tag('IP  ')<<8 == 0xA7000000, encode_tag('PORT')<<8 ==
-    0xC2FCB400 -- dokladnie te same wartosci co w TdfMemberInfo)."""
-    return [("IP  ", tdf.VARINT, ip), ("PORT", tdf.VARINT, port)]
-
-
-def build_network_address_union(ip: int, port: int):
-    """Blaze::NetworkAddress -- union, disc=2 => IpPairAddress {EXIP, INIP} (oba Blaze::IpAddress),
-    ksztalt potwierdzony w Impulsum14 (NetworkAddress.cs, IpPairAddress.cs). Uzywamy tego samego adresu
-    dla EXIP/INIP jak w build_ext_data_update -- oba klienty siedza w tej samej podsieci Radmin VPN."""
-    addr = build_ip_address(ip, port)
-    ip_pair = [("EXIP", tdf.STRUCT, addr), ("INIP", tdf.STRUCT, addr)]
-    return (2, ("VALU", tdf.STRUCT, ip_pair))
-
-
-def build_replicated_game_player(name: str, identity, uid: int, persona_id: int, game_id: int,
-                                  ip: int, port: int, slot_id: int = 0, team_index: int = 0,
-                                  state: int = 4):
-    """Blaze::GameManager::ReplicatedGamePlayer -- pola/tagi potwierdzone w Impulsum14
-    (GameManager/ReplicatedGamePlayer.cs). PID=PlayerId (BlazeId persony, jak PIDI w
-    build_user_identification), UID=PlayerSessionId (jak AID/ID gdzie indziej) -- to samo
-    rozroznienie uid/persona_id co reszta projektu (identity_for_persona)."""
-    _, ext_id, _blob = identity
-    return [
-        # Pola dodane wg refleksji EBOOT (ReplicatedGamePlayer: EXBL externalBlob, LOC accountLocale,
-        # NASP personaNamespace, PATT playerAttribs, TIME joinedGameTimestamp).
-        ("EXBL", tdf.BLOB, _blob),
-        ("EXID", tdf.VARINT, ext_id),
-        ("GID ", tdf.VARINT, game_id),
-        ("LOC ", tdf.VARINT, DEFAULT_LOCALE),
-        ("NAME", tdf.STRING, name),
-        ("NASP", tdf.STRING, PERSONA_NAMESPACE),
-        ("PATT", tdf.MAP, (tdf.STRING, tdf.STRING, [])),
-        # PID = PlayerId = BlazeId uzytkownika (to samo co UserIdentification.ID, USID.ID w createGame);
-        # wczesniej byl tu persona_id (PIDI), przez co SDK nie mogl dopasowac gracza z rostera do
-        # lokalnego uzytkownika (log 2026-10-08: host dostawal PID=1000000002 zamiast BlazeId 1000000001).
-        ("PID ", tdf.VARINT, uid),
-        ("PNET", tdf.UNION, build_network_address_union(ip, port)),
-        ("SID ", tdf.VARINT, slot_id),
-        ("SLOT", tdf.VARINT, 0),          # SlotType.SLOT_PUBLIC (Impulsum14 SlotType.cs)
-        ("STAT", tdf.VARINT, state),      # PlayerState: 2=ACTIVE_CONNECTING, 4=ACTIVE_CONNECTED (Impulsum14 PlayerState.cs)
-        ("TIDX", tdf.VARINT, team_index),
-        ("TIME", tdf.VARINT, int(time.time())),
-        ("UID ", tdf.VARINT, uid),
-    ]
-
-
-def build_replicated_game_data(game_id: int, game_name: str, host_ip: int, host_port: int,
-                                max_players: int, proto_version: str, network_topology: int = 130,
-                                host_uid: int = LOCAL_USER_ID, extra=None, game_state: int = 130):
-    """Blaze::GameManager::ReplicatedGameData (Impulsum14 GameManager/ReplicatedGameData.cs).
-    GSTA=PRE_GAME(130), NTOP domyslnie PEER_TO_PEER_FULL_MESH(130).
-
-    THST/PHST (TopologyHostInfo/PlatformHostInfo {HPID, HSLT}) i HSES wskazuja kto jest hostem gry --
-    bez nich SDK nie wie czy lokalny gracz jest hostem i nie uruchamia tworzenia sieci P2P (to byl
-    brakujacy element, host stal na "Sending match invite..."). `extra` to slownik z ECHEM pol z
-    zadania createGame (ATTR, CRIT, PCAP->CAP, GSET, PRES, VOIP, QCAP, TIDS, GTYP) -- serwer EA
-    odsyla klientowi to, co klient podal."""
-    extra = extra or {}
-    host_info = [("HPID", tdf.VARINT, host_uid), ("HSLT", tdf.VARINT, 0)]
-    fields = [
-        ("ADMN", tdf.LIST, (tdf.VARINT, [host_uid])),
-        ("GID ", tdf.VARINT, game_id),
-        ("GNAM", tdf.STRING, game_name),
-        ("GSET", tdf.VARINT, extra.get("GSET", 0)),
-        ("GSTA", tdf.VARINT, game_state),
-        ("GTYP", tdf.STRING, extra.get("GTYP", "gameType0")),
-        ("HNET", tdf.LIST, (tdf.UNION, [build_network_address_union(host_ip, host_port)])),
-        ("HSES", tdf.VARINT, host_uid),
-        ("MCAP", tdf.VARINT, max_players),
-        ("NRES", tdf.VARINT, 0),
-        ("NTOP", tdf.VARINT, network_topology),
-        ("PHST", tdf.STRUCT, host_info),
-        ("PRES", tdf.VARINT, extra.get("PRES", 1)),
-        ("QCAP", tdf.VARINT, extra.get("QCAP", 0)),
-        ("THST", tdf.STRUCT, host_info),
-        ("VOIP", tdf.VARINT, extra.get("VOIP", 2)),
-        ("VSTR", tdf.STRING, proto_version),
-    ]
-    if extra.get("ATTR") is not None:
-        fields.append(("ATTR", tdf.MAP, extra["ATTR"]))
-    if extra.get("CRIT") is not None:
-        fields.append(("CRIT", tdf.MAP, extra["CRIT"]))
-    if extra.get("CAP") is not None:
-        fields.append(("CAP ", tdf.LIST, extra["CAP"]))
-    if extra.get("TIDS") is not None:
-        fields.append(("TIDS", tdf.LIST, extra["TIDS"]))
-    return sorted(fields, key=lambda f: f[0])
-
-
-def build_notify_game_setup(game_data_fields, roster_players, setup_reason_disc: int = 0) -> bytes:
-    """NotifyGameSetup {GAME, PROS, QUEU, REAS} (0x0004/0x0014) -- ksztalt potwierdzony w Impulsum14
-    (GameManager/NotifyGameSetup.cs). REAS to unia GameSetupReason (GameSetupReason.cs): disc=0
-    DatalessSetupContext dla gracza ktory sam wywolal createGame, disc=2 IndirectJoinGameSetupContext
-    dla gracza dolaczanego do gry bez wlasnego wywolania createGame/joinGame (patrz komentarz przy
-    obsludze CREATE_GAME_COMMAND) -- oba warianty istnieja w unii, wybor miedzy nimi to decyzja
-    projektowa serwera co do PRZYCZYNY dolaczenia, nie zgadywanie ksztaltu protokolu."""
-    payload = tdf.encode([
-        ("GAME", tdf.STRUCT, game_data_fields),
-        ("PROS", tdf.LIST, (tdf.STRUCT, roster_players)),
-        ("QUEU", tdf.LIST, (tdf.STRUCT, [])),
-        ("REAS", tdf.UNION, (setup_reason_disc, ("VALU", tdf.STRUCT, []))),
-    ])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_SETUP, payload)
-
-
-NOTIFY_PLAYER_JOINING = 0x0015
-ADVANCE_GAME_STATE_COMMAND = 0x0003
-# zadania GameManager, ktorych skutek serwer tylko rozsyla wszystkim graczom jako powiadomienie
-# (ksztalt zadania == ksztalt powiadomienia w Impulsum14: setGameAttributes {ATTR,GID} -> 80,
-# setPlayerAttributes {ATTR,GID,PID} -> 90, advanceGameState {GID,GSTA} -> NotifyGameStateChange 100)
-GM_BROADCAST_COMMANDS = {
-    0x0003: (0x0064, "advanceGameState -> NotifyGameStateChange"),
-    0x0007: (0x0050, "setGameAttributes -> NotifyGameAttribChange"),
-    0x0008: (0x005A, "setPlayerAttributes -> NotifyPlayerAttribChange"),
-}
-UPDATE_MESH_CONNECTION_COMMAND = 0x001D      # FIFA17: {FLGS, GID, QOSI, SCG, STAT, TCG}; STAT 2 = CONNECTED
-FINALIZE_GAME_CREATION_COMMAND = 0x000F      # {GID, NPSI, XNNC, XSES}
-NOTIFY_PLAYER_JOIN_COMPLETED = 0x001E
-NOTIFY_PLATFORM_HOST_INITIALIZED = 0x0047
-_GAMES: dict = {}   # game_id -> {"host": name, "players": [names]}
-
-
-def _uid_seen_by(viewer: str, name: str) -> int:
-    """BlazeId gracza `name` widziany przez klienta `viewer` (siebie zna jako LOCAL_USER_ID)."""
-    return LOCAL_USER_ID if viewer == name else _persona_user_id(name)
-
-
-def build_notify_player_join_completed(game_id: int, pid: int) -> bytes:
-    # FIFA17 (refleksja EBOOT: gameId GID, playerId PID, joinedGameTimestamp TIME)
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, pid),
-                          ("TIME", tdf.VARINT, int(time.time()))])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOIN_COMPLETED, payload)
-
-
-def build_notify_player_joining(game_id: int, player_fields) -> bytes:
-    """NotifyPlayerJoining {GID, PDAT: ReplicatedGamePlayer} (0x0004/0x0015)."""
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PDAT", tdf.STRUCT, player_fields)])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLAYER_JOINING, payload)
-
-
-def build_notify_platform_host_initialized(game_id: int, platform_host_id: int = 0) -> bytes:
-    # FIFA17 (refleksja EBOOT): gameId GID, platformHostId PHID (nie PHST jak w Impulsum14)
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PHID", tdf.VARINT, platform_host_id),
-                          ("PHST", tdf.VARINT, 0)])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_PLATFORM_HOST_INITIALIZED, payload)
-
-
-NOTIFY_GAME_STATE_CHANGE = 0x0064
-NOTIFY_GAME_PLAYER_STATE_CHANGE = 0x0074
-
-
-def build_notify_game_state_change(game_id: int, state: int = 130) -> bytes:
-    """NotifyGameStateChange {GID, GSTA} (0x0004/0x0064), ksztalt z Impulsum14; 130 = PRE_GAME."""
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("GSTA", tdf.VARINT, state)])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_STATE_CHANGE, payload)
-
-
-def build_notify_game_player_state_change(game_id: int, persona_id: int, state: int = 4) -> bytes:
-    """NotifyGamePlayerStateChange {GID, PID, STAT} (0x0004/0x0074); 4 = ACTIVE_CONNECTED."""
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id), ("PID ", tdf.VARINT, persona_id),
-                          ("STAT", tdf.VARINT, state)])
-    return build_notification(GAME_MANAGER_COMPONENT, NOTIFY_GAME_PLAYER_STATE_CHANGE, payload)
-
-
-def build_create_game_response(component: int, command: int, msg_num: int, game_id: int) -> bytes:
-    """CreateGameResponse {GID} -- JEDYNE pole, potwierdzone w Impulsum14 (GameManager/
-    CreateGameResponse.cs: dokladnie jeden czlonek, mGameId/GID, UInt32)."""
-    payload = tdf.encode([("GID ", tdf.VARINT, game_id)])
-    return build_reply(component, command, msg_num, payload)
+def build_reply_fields(component: int, command: int, msg_num: int, fields) -> bytes:
+    """Odpowiedz Reply z polami TDF (pola sortowane po tagu)."""
+    return build_reply(component, command, msg_num, tdf.encode(sorted(fields, key=lambda f: f[0])))
 
 
 def _find_field(fields, tag):
+    tag = tag.rstrip()
     for t, _typ, v in fields:
-        if t == tag:
+        if t.rstrip() == tag:
             return v
     return None
 
@@ -757,9 +601,38 @@ def build_get_account_response(component: int, command: int, msg_num: int, ident
         ("STAT", tdf.VARINT, 0),
         ("TPOT", tdf.VARINT, 0),
         ("UDU ", tdf.VARINT, 0),
-        ("UID ", tdf.VARINT, LOCAL_USER_ID),
+        ("UID ", tdf.VARINT, ids.uid_for(name)),
     ]
     return build_reply(component, command, msg_num, tdf.encode(fields))
+
+
+ENTITLEMENT_STATUS_ACTIVE = 1
+ENTITLEMENT_TYPE_DEFAULT = 5
+ENTITLEMENT_PROJECT = "FIFA17"
+
+
+def build_entitlements_response(component: int, command: int, msg_num: int, identity, groups) -> bytes:
+    """Authentication::listEntitlements -> Entitlements {NLST: lista Entitlement}. Klient pyta o grupy
+    (FIFA17PS3BoxContent, FIFA17PS3, FIFA16PS3, FIFAWC14PS3); dzialajacy serwer FIFA 14 odpowiada jedna
+    AKTYWNA pozycja na kazda zadana grupe -- bez tego gra uznaje, ze gracz nie ma zadnych praw (pusta lista).
+    Pola Entitlement (16, identyczne jak w FIFA 14) wg refleksji EBOOT."""
+    name = identity[0]
+    items = []
+    for i, group in enumerate(groups):
+        items.append(sorted([
+            ("GNAM", tdf.STRING, group),
+            ("ID  ", tdf.VARINT, 1000 + i),
+            ("ISCO", tdf.VARINT, 0),
+            ("PID ", tdf.VARINT, ids.persona_id_for(name)),
+            ("PJID", tdf.STRING, ENTITLEMENT_PROJECT),
+            ("PRID", tdf.STRING, group),
+            ("STAT", tdf.VARINT, ENTITLEMENT_STATUS_ACTIVE),
+            ("TAG ", tdf.STRING, group),
+            ("TYPE", tdf.VARINT, ENTITLEMENT_TYPE_DEFAULT),
+            ("UCNT", tdf.VARINT, 0),
+            ("VER ", tdf.VARINT, 0),
+        ], key=lambda f: f[0]))
+    return build_reply(component, command, msg_num, tdf.encode([("NLST", tdf.LIST, (tdf.STRUCT, items))]))
 
 
 def build_login_response(component: int, command: int, msg_num: int, request_fields,
@@ -775,14 +648,14 @@ def build_login_response(component: int, command: int, msg_num: int, request_fie
     persona = [
         ("DSNM", tdf.STRING, name),
         ("LAST", tdf.VARINT, now),
-        ("PID ", tdf.VARINT, LOCAL_PERSONA_ID),
+        ("PID ", tdf.VARINT, ids.persona_id_for(name)),
         ("PLAT", tdf.VARINT, PLATFORM_PS3),
         ("STAS", tdf.VARINT, PERSONA_STATUS_ACTIVE),
         ("XREF", tdf.VARINT, ext_id),
     ]
     sess = [
         ("1CON", tdf.VARINT, 0),
-        ("BUID", tdf.VARINT, LOCAL_USER_ID),
+        ("BUID", tdf.VARINT, ids.uid_for(name)),
         ("FRST", tdf.VARINT, 0),
         ("KEY ", tdf.STRING, LOCAL_SESSION_KEY),
         ("LLOG", tdf.VARINT, now),
@@ -790,7 +663,7 @@ def build_login_response(component: int, command: int, msg_num: int, request_fie
     ]
     if "pdtl" in want:
         sess.append(("PDTL", tdf.STRUCT, persona))
-    sess.append(("UID ", tdf.VARINT, LOCAL_USER_ID))
+    sess.append(("UID ", tdf.VARINT, ids.uid_for(name)))
     fields = [
         ("ANON", tdf.VARINT, 0),
         ("NTOS", tdf.VARINT, 0),
@@ -931,14 +804,14 @@ def build_telemetry_server(host: str, port: int):
 
 
 def build_post_auth_response(component: int, command: int, msg_num: int, host: str,
-                             telemetry_port: int, ticker_port: int) -> bytes:
+                             telemetry_port: int, ticker_port: int, uid: int = LOCAL_USER_ID) -> bytes:
     """Util::postAuth -> PostAuthResponse {TELE, TICK, UROP}. Dotad odpowiadalismy pusto, wiec klient
     nie mial adresu serwera ticker (gorny pasek) ani telemetrii."""
     payload = tdf.encode([
         ("TELE", tdf.STRUCT, build_telemetry_server(host, telemetry_port)),
         ("TICK", tdf.STRUCT, [("ADRS", tdf.STRING, host), ("PORT", tdf.VARINT, ticker_port),
                               ("SKEY", tdf.STRING, "key")]),
-        ("UROP", tdf.STRUCT, [("TMOP", tdf.VARINT, 0), ("UID ", tdf.VARINT, LOCAL_USER_ID)]),
+        ("UROP", tdf.STRUCT, [("TMOP", tdf.VARINT, 0), ("UID ", tdf.VARINT, uid)]),
     ])
     return build_reply(component, command, msg_num, payload)
 
@@ -1102,7 +975,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     cap.note(f"-> wysylam fetchClientConfig CFID={cfid!r} (Reply, msg_num={msg_num})")
                 elif component == UTIL_COMPONENT and command == UTIL_POST_AUTH_COMMAND and cfg.serve_post_auth:
                     resp = build_post_auth_response(component, command, msg_num, cfg.blaze_advertise_host,
-                                                    cfg.ea_telemetry_port, cfg.ticker_port)
+                                                    cfg.ea_telemetry_port, cfg.ticker_port,
+                                                    ids.uid_for(identity[0]) if identity else LOCAL_USER_ID)
                     cap.note(f"-> wysylam PostAuthResponse {{TELE, TICK, UROP}} (Reply, msg_num={msg_num}), "
                              f"{len(resp)-HDR_LEN}B payloadu")
                 elif component == UTIL_COMPONENT and command == UTIL_GET_TELEMETRY_SERVER_COMMAND and cfg.serve_post_auth:
@@ -1120,7 +994,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     if cfg.send_user_authenticated:
                         extras.append(("UserAuthenticated [0x7802::0x0008]", build_user_authenticated(identity)))
                     extras.append(("NotifyUserAdded [0x7802::0x0002]", build_user_added(identity)))
-                    extras.append(("UserUpdated [0x7802::0x0005]", build_user_updated()))
+                    extras.append(("UserUpdated [0x7802::0x0005]", build_user_updated(identity)))
                 elif (component == UTIL_COMPONENT and identity is not None and cfg.persist_user_settings
                       and command in (USER_SETTINGS_LOAD_COMMAND, USER_SETTINGS_SAVE_COMMAND,
                                       USER_SETTINGS_LOAD_ALL_COMMAND)):
@@ -1175,7 +1049,7 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                         port = _find_field(inip_v, "PORT") or 0
                         maci = _find_field(valu_v, "MACI") or 0
                     if identity is not None:
-                        _update_player_network(identity[0], ip, port)
+                        _update_player_network(identity[0], ip, port, maci)
                     best_ping_site = ""
                     nlmp_v = _find_field(info_v, "NLMP")
                     if nlmp_v is not None:
@@ -1188,7 +1062,8 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                     natt = _find_field(nqos_v, "NATT") or 0
                     extras.append(("UserSessionExtendedDataUpdate [0x7802::0x0001]",
                                     build_ext_data_update(maci=maci, port=port, best_ping_site=best_ping_site,
-                                                           dbps=dbps, ubps=ubps, natt=natt)))
+                                                           dbps=dbps, ubps=ubps, natt=natt,
+                                                           uid=ids.uid_for(identity[0]) if identity else LOCAL_USER_ID)))
                 elif (component == USER_SESSIONS_COMPONENT and command == LOOKUP_USERS_BY_PERSONA_NAMES_COMMAND
                       and identity is not None and cfg.lookup_users_empty_reply):
                     resp = build_reply(component, command, msg_num, b"")
@@ -1248,227 +1123,95 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                              f"(z ostatniego getStatGroup), {len(resp)-HDR_LEN}B payloadu")
                     extras.append(("GetStatsAsyncNotification [0x0007::0x0032]",
                                     build_stats_async_notification(group_name, view_id, entity_ids)))
-                elif (component == GAME_MANAGER_COMPONENT and command == CREATE_GAME_COMMAND
-                      and identity is not None):
-                    # GameManager::createGame -- KLIENT WYSYLA TO PO KLIKNIECIU "Play Match", SERWER
-                    # DOTAD ODPOWIADAL PUSTO (fallback ponizej), stad zawieszenie na "Sending match
-                    # invite and creating a game session". Realny ksztalt zadania FIFA17 (potwierdzony
-                    # na drucie, sesja 2026-09-26) rozni sie od CreateGameRequest.cs z Impulsum14:
-                    # klient opakowuje dane w CMGD {GGTY,GVER,OSID,PNET,XNET} i GMCD {ATTR,CRIT,GNAM,
-                    # GSET,NTOP,PMAX,PMIN,PRES,QCAP,...} zamiast pol plaskich na najwyzszym poziomie --
-                    # GNAM/PMAX/NTOP sa WEWNATRZ GMCD, GVER (nie VSTR) jest wewnatrz CMGD. PLJD.PLDL
-                    # zawiera TYLKO wlasny wpis gracza-tworcy (USID.NAME='playerA' w przechwycie), NIE
-                    # tozsamosc zapraszanego -- ten kto ma zostac zaproszony nie jest w tym zadaniu wcale,
-                    # wiec budujemy to z WLASNEGO stanu serwera: w tym projekcie zawsze dokladnie dwoch
-                    # graczy (host + znajomy przez RPCN), wiec zapraszamy KAZDEGO innego aktualnie
-                    # zalogowanego gracza -- to decyzja logiki serwera, nie zalozenie co do protokolu.
-                    host_name = identity[0]
-                    gmcd_v = _find_field(fields, "GMCD") or []
-                    cmgd_v = _find_field(fields, "CMGD") or []
-                    game_name = _find_field(gmcd_v, "GNAM") or f"{host_name}'s game"
-                    proto_version = _find_field(cmgd_v, "GVER") or ""
-                    max_players = _find_field(gmcd_v, "PMAX") or 2
-
-                    with _GAMES_LOCK:
-                        game_id = _next_game_id[0]
-                        _next_game_id[0] += 1
-
-                    with _PLAYERS_LOCK:
-                        host_info = _PLAYERS.get(host_name, {})
-                        other_names = [n for n in _PLAYERS if n != host_name]
-                        cap.note(f"-> createGame od {host_name!r}, rejestr graczy: {sorted(_PLAYERS)}")
-                    host_ip = host_info.get("peer_ip") or host_info.get("ip", 0)
-                    host_port = host_info.get("port", 0) or 3659
-
-                    resp = build_create_game_response(component, command, msg_num, game_id)
-                    cap.note(f"-> wysylam CreateGameResponse GID={game_id} dla {host_name!r} "
-                             f"(Reply, msg_num={msg_num})")
-
-                    other_list = list(other_names)
-                    faithful = cfg.gm_faithful_flow
-                    # faithful: w grze jest na poczatku tylko host (stan CONNECTED), zapraszani dolaczaja
-                    # dopiero po finalizeGameCreation hosta (jak w prawdziwym Blaze: host inicjuje siec,
-                    # potem NotifyPlatformHostInitialized, potem dolaczajacy lacza sie z hostem).
-                    _GAMES[game_id] = {"host": host_name,
-                                       "players": [host_name] if faithful else [host_name] + other_list,
-                                       "pending": list(other_list) if faithful else []}
-                    network_topology = _find_field(gmcd_v, "NTOP") or 130
-                    echo = {"GSET": _find_field(gmcd_v, "GSET") or 0,
-                            "PRES": _find_field(gmcd_v, "PRES") or 1,
-                            "VOIP": _find_field(gmcd_v, "VOIP") or 2,
-                            "QCAP": _find_field(gmcd_v, "QCAP") or 0,
-                            "GTYP": _find_field(fields, "GTYP") or "gameType0",
-                            "ATTR": _find_field(gmcd_v, "ATTR"),
-                            "CRIT": _find_field(gmcd_v, "CRIT"),
-                            "CAP": _find_field(fields, "PCAP"),
-                            "TIDS": _find_field(fields, "TIDS")}
-
-                    def player_entry(viewer: str, pname: str, slot: int, state: int):
-                        """ReplicatedGamePlayer `pname` widziany oczami `viewer` (kazdy klient zna SIEBIE
-                        pod LOCAL_USER_ID, a pozostalych pod ich haszowanymi BlazeId)."""
+                elif (component == AUTH_COMPONENT and command == LIST_ENTITLEMENTS_COMMAND
+                      and identity is not None and cfg.serve_entitlements):
+                    glist = _find_field(fields, "GNLS")
+                    groups = list(glist[1]) if isinstance(glist, tuple) else []
+                    resp = build_entitlements_response(component, command, msg_num, identity, groups)
+                    cap.note(f"-> wysylam Entitlements (po jednej AKTYWNEJ pozycji na grupe) dla {groups!r} "
+                             f"(Reply, msg_num={msg_num}), {len(resp)-HDR_LEN}B payloadu")
+                elif (component == messaging.MESSAGING_COMPONENT and identity is not None
+                      and cfg.serve_messaging and command in (messaging.CMD_SEND_MESSAGE, messaging.CMD_FETCH_MESSAGES,
+                                                              messaging.CMD_GET_MESSAGES)):
+                    def _ident(n):
                         with _PLAYERS_LOCK:
-                            v_ident = _PLAYERS.get(viewer, {}).get("identity") or identity
-                            p_info = _PLAYERS.get(pname, {})
-                        p_name, p_ext, p_blob, p_uid, p_pid = identity_for_persona(pname, v_ident)
-                        return build_replicated_game_player(
-                            p_name, (p_name, p_ext, p_blob), p_uid, p_pid, game_id,
-                            p_info.get("peer_ip") or p_info.get("ip", 0), p_info.get("port", 0) or 3659,
-                            slot_id=slot, team_index=min(slot, 1), state=state)
-
-                    def make_setup(viewer: str, disc: int, names, game_state: int):
-                        """NotifyGameSetup widziany oczami gracza `viewer` dla graczy `names`."""
+                            e = _PLAYERS.get(n)
+                        return (e.get("identity") if e and e.get("identity") else (n, 0, b""))
+                    if command == messaging.CMD_SEND_MESSAGE:
                         with _PLAYERS_LOCK:
-                            v_ident = _PLAYERS.get(viewer, {}).get("identity") or identity
-                        roster_v = []
-                        for slot, pname in enumerate(names):
-                            if faithful:
-                                st = 4 if pname == host_name else 2
+                            online = list(_PLAYERS)
+                        reply_fields, notes = messaging.send_message(identity[0], identity, fields, online, _ident)
+                        resp = build_reply_fields(component, command, msg_num, reply_fields)
+                        for target, frame in notes:
+                            if target == identity[0]:
+                                extras.append(("NotifyMessage [0x000F::0x0001] (do siebie)", frame))
                             else:
-                                st = cfg.gm_initial_player_state
-                            roster_v.append(player_entry(viewer, pname, slot, st))
-                        host_uid_v = identity_for_persona(host_name, v_ident)[3]
-                        gd = build_replicated_game_data(game_id, game_name, host_ip, host_port,
-                                                        max_players, proto_version, network_topology,
-                                                        host_uid=host_uid_v, extra=echo,
-                                                        game_state=game_state)
-                        return roster_v, build_notify_game_setup(gd, roster_v, setup_reason_disc=disc)
-
-                    _GAMES[game_id]["make_setup"] = make_setup
-                    _GAMES[game_id]["player_entry"] = player_entry
-                    init_state = 1 if cfg.gm_deferred_pregame else 130
-                    invited = [] if faithful else list(other_list)
-                    host_names = [host_name] if faithful else [host_name] + other_list
-                    host_roster, host_frame = make_setup(host_name, 0, host_names, init_state)
-                    extras.append(("NotifyGameSetup [0x0004::0x0014] (host, DatalessSetupContext)", host_frame))
-                    if faithful:
-                        cap.note(f"-> tryb faithful: zapraszani ({other_list}) dolacza po finalizeGameCreation hosta")
-                        if not cfg.gm_deferred_pregame:
-                            extras.append(("NotifyGameStateChange PRE_GAME",
-                                           build_notify_game_state_change(game_id)))
-                    elif cfg.gm_send_player_joining:
-                        # host dowiaduje sie o dolaczajacym graczu (jak w prawdziwym flow joinGame)
-                        for pl in host_roster[1:]:
-                            extras.append(("NotifyPlayerJoining [0x0004::0x0015]",
-                                           build_notify_player_joining(game_id, pl)))
-                    invited_rosters = {}
-                    if invited:
-                        for other_name in invited:
-                            inv_roster, frame = make_setup(other_name, 2, [host_name] + other_list, init_state)
-                            invited_rosters[other_name] = inv_roster
-                            if not _send_frame(other_name, frame, cap,
-                                               "NotifyGameSetup [0x0004::0x0014] "
-                                               "(zaproszony, IndirectJoinGameSetupContext)"):
-                                cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {other_name!r} "
-                                         f"(rozlaczony?)")
-                    elif not faithful:
-                        cap.note(f"-> UWAGA: brak innych zalogowanych graczy do zaproszenia do gry {game_id}")
-                    roster = host_roster
-                    if cfg.gm_followups and not faithful:
-                        followups = []
-                        if cfg.gm_initial_player_state == 4:
-                            followups = [("NotifyGamePlayerStateChange [0x0004::0x0074] PID=%d" % pid,
-                                          build_notify_game_player_state_change(game_id, pid))
-                                         for pid in [_find_field(p, "PID ") for p in roster]]
-                        if not cfg.gm_deferred_pregame:
-                            followups.append(("NotifyGameStateChange [0x0004::0x0064] PRE_GAME",
-                                              build_notify_game_state_change(game_id)))
-                        extras.extend(followups)
-                        for other_name in invited:
-                            inv_pids = [_find_field(p, "PID ") for p in invited_rosters.get(other_name, [])]
-                            inv_followups = []
-                            if cfg.gm_initial_player_state == 4:
-                                inv_followups = [build_notify_game_player_state_change(game_id, pid)
-                                                 for pid in inv_pids]
-                            if not cfg.gm_deferred_pregame:
-                                inv_followups.append(build_notify_game_state_change(game_id))
-                            for fr in inv_followups:
-                                _send_frame(other_name, fr, cap, "GameManager follow-up (zaproszony)")
-                elif (component == GAME_MANAGER_COMPONENT and identity is not None
-                      and command in (UPDATE_MESH_CONNECTION_COMMAND, FINALIZE_GAME_CREATION_COMMAND)
-                      and cfg.gm_followups):
-                    gid = _find_field(fields, "GID") or 0
-                    resp = build_reply(component, command, msg_num, b"")
-                    game = _GAMES.get(gid)
-                    me = identity[0]
-                    if game is None:
-                        cap.note(f"-> GameManager 0x{command:04X} dla nieznanej gry GID={gid}: pusta odpowiedz")
-                    elif command == UPDATE_MESH_CONNECTION_COMMAND and _find_field(fields, "STAT") == 2:
-                        cap.note(f"-> updateMeshConnection od {me!r} GID={gid} STAT=CONNECTED: "
-                                 f"rozsylam ACTIVE_CONNECTED + NotifyPlayerJoinCompleted do {game['players']}")
-                        for viewer in game["players"]:
-                            pid = _uid_seen_by(viewer, me)
-                            frames = [build_notify_game_player_state_change(gid, pid),
-                                      build_notify_player_join_completed(gid, pid)]
-                            for fr in frames:
-                                if viewer == me:
-                                    extras.append(("GameManager join-completed (do nadawcy)", fr))
-                                else:
-                                    _send_frame(viewer, fr, cap, "GameManager join-completed")
-                    elif command == FINALIZE_GAME_CREATION_COMMAND and game.get("pending"):
-                        # tryb faithful: host zainicjowal siec -> PRE_GAME, potem dolaczaja zapraszani
-                        cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: PRE_GAME + dolaczenie "
-                                 f"{game['pending']} (tryb faithful)")
-                        if cfg.gm_deferred_pregame:
-                            extras.append(("NotifyGameStateChange PRE_GAME", build_notify_game_state_change(gid)))
-                        extras.append(("NotifyPlatformHostInitialized",
-                                       build_notify_platform_host_initialized(gid, LOCAL_USER_ID)))
-                        for inv in list(game["pending"]):
-                            names = game["players"] + [inv]
-                            _r, setup_frame = game["make_setup"](inv, 2, names, 130)
-                            if not _send_frame(inv, setup_frame, cap,
-                                               "NotifyGameSetup (zaproszony, po finalize)"):
-                                cap.note(f"-> nie udalo sie wyslac NotifyGameSetup do {inv!r}")
-                                continue
-                            _send_frame(inv, build_notify_platform_host_initialized(
-                                gid, _uid_seen_by(inv, game["host"])), cap, "NotifyPlatformHostInitialized")
-                            extras.append(("NotifyPlayerJoining [0x0004::0x0015]", build_notify_player_joining(
-                                gid, game["player_entry"](game["host"], inv, len(game["players"]), 2))))
-                            game["players"].append(inv)
-                        game["pending"] = []
-                    elif command == FINALIZE_GAME_CREATION_COMMAND:
-                        cap.note(f"-> finalizeGameCreation od {me!r} GID={gid}: "
-                                 f"NotifyPlatformHostInitialized do {game['players']}")
-                        for viewer in game["players"]:
-                            fr = build_notify_platform_host_initialized(gid, _uid_seen_by(viewer, game['host']))
-                            if viewer == me:
-                                extras.append(("NotifyPlatformHostInitialized", fr))
-                            else:
-                                _send_frame(viewer, fr, cap, "NotifyPlatformHostInitialized")
-                        if cfg.gm_deferred_pregame:
-                            cap.note(f"-> GameState INITIALIZING -> PRE_GAME(130) po finalizeGameCreation GID={gid}")
-                            for viewer in game["players"]:
-                                fr = build_notify_game_state_change(gid)
-                                if viewer == me:
-                                    extras.append(("NotifyGameStateChange PRE_GAME", fr))
-                                else:
-                                    _send_frame(viewer, fr, cap, "NotifyGameStateChange PRE_GAME")
+                                _send_frame(target, frame, cap, "NotifyMessage [0x000F::0x0001]")
+                        cap.note(f"-> Messaging::sendMessage od {identity[0]!r} TYPE={_find_field(fields, 'TYPE')} "
+                                 f"TIDS={_find_field(fields, 'TIDS')}: dostarczono {len(notes)} powiadomien")
+                    elif command == messaging.CMD_FETCH_MESSAGES:
+                        reply_fields, notes = messaging.fetch_messages(identity[0], fields, _ident)
+                        resp = build_reply_fields(component, command, msg_num, reply_fields)
+                        for frame in notes:
+                            extras.append(("NotifyMessage [0x000F::0x0001]", frame))
+                        cap.note(f"-> Messaging::fetchMessages TYPE={_find_field(fields, 'TYPE')}: {len(notes)} wiadomosci")
                     else:
-                        cap.note(f"-> GameManager 0x{command:04X} GID={gid} STAT={_find_field(fields, 'STAT')}: "
-                                 f"pusta odpowiedz")
-                elif (component == GAME_MANAGER_COMPONENT and identity is not None
-                      and command in GM_BROADCAST_COMMANDS and cfg.gm_followups):
-                    gid = _find_field(fields, "GID") or 0
-                    resp = build_reply(component, command, msg_num, b"")
-                    game = _GAMES.get(gid)
+                        resp = build_reply_fields(component, command, msg_num,
+                                                  messaging.get_messages(identity[0], fields, _ident))
+                        cap.note(f"-> Messaging::getMessages TYPE={_find_field(fields, 'TYPE')}")
+                elif component == GAME_MANAGER_COMPONENT and identity is not None and cfg.gm_enabled:
                     me = identity[0]
-                    notif_id, label = GM_BROADCAST_COMMANDS[command]
-                    if game is None:
-                        cap.note(f"-> GameManager {label} dla nieznanej gry GID={gid}: pusta odpowiedz")
+                    outs = []
+                    if command == gamemgr.CMD_CREATE_GAME:
+                        with _PLAYERS_LOCK:
+                            others = [n for n in _PLAYERS if n != me]
+                            cap.note(f"-> createGame od {me!r}, rejestr graczy: {sorted(_PLAYERS)}")
+                        gid, reply_fields, outs = gamemgr.create_game(cfg, me, fields, others, _lookup_player)
+                        resp = build_reply_fields(component, command, msg_num, reply_fields)
+                        cap.note(f"-> wysylam CreateGameResponse GID={gid} dla {me!r} (Reply, msg_num={msg_num}); "
+                                 f"zapraszani po finalizeGameCreation: {others}")
+                    elif command == gamemgr.CMD_FINALIZE_GAME_CREATION:
+                        resp = build_reply(component, command, msg_num, b"")
+                        outs = gamemgr.finalize_game(cfg, me, fields, _lookup_player)
+                        cap.note(f"-> finalizeGameCreation od {me!r} GID={_find_field(fields, 'GID')}: "
+                                 f"{len(outs)} powiadomien")
+                    elif command == gamemgr.CMD_UPDATE_MESH_CONNECTION:
+                        resp = build_reply(component, command, msg_num, b"")
+                        outs = gamemgr.update_mesh_connection(cfg, me, fields, _lookup_player)
+                        cap.note(f"-> updateMeshConnection od {me!r} GID={_find_field(fields, 'GID')} "
+                                 f"STAT={_find_field(fields, 'STAT')} TCG={_find_field(fields, 'TCG')}: "
+                                 f"{len(outs)} powiadomien")
+                    elif command == gamemgr.CMD_REMOVE_PLAYER:
+                        resp = build_reply(component, command, msg_num, b"")
+                        outs = gamemgr.remove_player(cfg, me, fields, _lookup_player)
+                        cap.note(f"-> removePlayer od {me!r} GID={_find_field(fields, 'GID')} "
+                                 f"PID={_find_field(fields, 'PID')}: {len(outs)} powiadomien")
+                    elif command == gamemgr.CMD_DESTROY_GAME:
+                        resp = build_reply(component, command, msg_num, b"")
+                        outs = gamemgr.destroy_game(cfg, me, fields, _lookup_player)
+                        cap.note(f"-> destroyGame od {me!r} GID={_find_field(fields, 'GID')}: {len(outs)} powiadomien")
+                    elif command == gamemgr.CMD_JOIN_GAME:
+                        reply_fields, outs = gamemgr.join_game(cfg, me, fields, _lookup_player)
+                        if reply_fields is None:
+                            resp = build_reply(component, command, msg_num, b"")
+                            cap.note(f"-> joinGame od {me!r}: nieznana gra GID={_find_field(fields, 'GID')}")
+                        else:
+                            resp = build_reply_fields(component, command, msg_num, reply_fields)
+                            cap.note(f"-> joinGame od {me!r} GID={_find_field(fields, 'GID')}: {len(outs)} powiadomien")
+                    elif command in (gamemgr.CMD_ADVANCE_GAME_STATE, gamemgr.CMD_SET_GAME_ATTRIBUTES,
+                                     gamemgr.CMD_SET_PLAYER_ATTRIBUTES):
+                        resp = build_reply(component, command, msg_num, b"")
+                        outs = gamemgr.broadcast_change(cfg, me, command, fields)
+                        cap.note(f"-> GameManager 0x{command:04X} od {me!r} GID={_find_field(fields, 'GID')}: "
+                                 f"{len(outs)} powiadomien")
                     else:
-                        cap.note(f"-> GameManager {label} od {me!r} GID={gid}: rozsylam do {game['players']}")
-                        for viewer in game["players"]:
-                            out = []
-                            for t, typ, v in fields:
-                                if t == "PID" and typ == tdf.VARINT:
-                                    v = _uid_seen_by(viewer, me)
-                                out.append((t, typ, v))
-                            if command == ADVANCE_GAME_STATE_COMMAND:
-                                out = [(t, typ, v) for t, typ, v in out if t in ("GID", "GSTA")]
-                            fr = build_notification(GAME_MANAGER_COMPONENT, notif_id, tdf.encode(out))
-                            if viewer == me:
-                                extras.append((f"GameManager {label}", fr))
-                            else:
-                                _send_frame(viewer, fr, cap, f"GameManager {label}")
+                        resp = build_reply(component, command, msg_num, b"")
+                        cap.note(f"-> NIEOBSLUZONE zadanie GameManager 0x{command:04X}: pusta odpowiedz (msg_num={msg_num})")
+                    for target, label, frame in outs:
+                        if target == me:
+                            extras.append((label, frame))
+                        elif not _send_frame(target, frame, cap, label):
+                            cap.note(f"-> nie udalo sie wyslac {label} do {target!r} (rozlaczony?)")
                 else:
                     resp = build_reply(component, command, msg_num, b"")
                     cap.note(f"-> NIEOBSLUZONE zadanie component=0x{component:04X} command=0x{command:04X}: "
@@ -1495,6 +1238,10 @@ def handle(conn: socket.socket, addr, cfg: Config, ctx: ssl.SSLContext) -> None:
                 removed = _unregister_player(identity[0], stream)
                 cap.note(f"-> zamkniecie polaczenia gracza {identity[0]!r}: "
                          f"{'usunieto z rejestru' if removed else 'wpis nalezy juz do nowszego polaczenia, zostaje'}")
+                if removed and cfg.gm_enabled:
+                    # gracz zniknal -- wypisz go z gier i powiadom pozostalych
+                    for target, label, frame in gamemgr.on_disconnect(cfg, identity[0], _lookup_player):
+                        _send_frame(target, frame, cap, label)
         finally:
             try:
                 if stream is not None:

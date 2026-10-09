@@ -48,6 +48,46 @@ def _client_ctx(ca: Path, legacy: bool = False) -> ssl.SSLContext:
     return ctx
 
 
+def _gamemgr_checks() -> None:
+    """GameManager: przebieg create -> mesh -> finalize -> dolaczenie na syntetycznych graczach (bez gniazd)."""
+    from . import gamemgr, ids
+
+    cfg = Config()
+    gamemgr.reset()
+    reg = {
+        "host": {"identity": ("host", 1, b"h" * 36), "ip": 1, "port": 3659, "peer_ip": 0x0A000001, "maci": 5},
+        "guest": {"identity": ("guest", 2, b"g" * 36), "ip": 2, "port": 3659, "peer_ip": 0x0A000002, "maci": 6},
+    }
+    lookup = reg.get
+    req = [("CMGD", tdf.STRUCT, [("GVER", tdf.STRING, "qa-only")]),
+           ("GMCD", tdf.STRUCT, [("NTOP", tdf.VARINT, 130), ("PMAX", tdf.VARINT, 2), ("GSET", tdf.VARINT, 1060)]),
+           ("GTYP", tdf.STRING, "gameType20")]
+    gid, _reply, outs = gamemgr.create_game(cfg, "host", req, ["guest"], lookup)
+    check("GameManager: host dostaje tylko wlasne NotifyGameSetup", [o[0] for o in outs] == ["host"])
+    setup = tdf.decode(outs[0][2][16:])
+    reas = dict((t, v) for t, _t, v in setup)["REAS"]
+    check("GameManager: REAS = unia DLSC (numer 0, tag DLSC) z DCTX=0", reas[0] == 0 and reas[1][0] == "DLSC"
+          and reas[1][2] == [("DCTX", tdf.VARINT, 0)], str(reas))
+    roster = dict((t, v) for t, _t, v in setup)["PROS"][1]
+    cong = dict((t, v) for t, _t, v in roster[0])["CONG"]
+    check("GameManager: roster ma niezerowe, unikalne CONG", cong == ids.connection_group_id_for("host") != 0)
+    fin = gamemgr.finalize_game(cfg, "host", [("GID ", tdf.VARINT, gid)], lookup)
+    guest_setup = [o for o in fin if o[0] == "guest" and o[2][8:10] == (0x14).to_bytes(2, "big")]
+    check("GameManager: po finalizeGameCreation zaproszony dostaje NotifyGameSetup", len(guest_setup) == 1)
+    g = tdf.decode(guest_setup[0][2][16:])
+    greas = dict((t, v) for t, _t, v in g)["REAS"]
+    check("GameManager: zaproszony: REAS = IJGS (numer 1)", greas[0] == 1 and greas[1][0] == "IJGS", str(greas))
+    groster = dict((t, v) for t, _t, v in g)["PROS"][1]
+    congs = {dict((t, v) for t, _t, v in r)["NAME"]: dict((t, v) for t, _t, v in r)["CONG"] for r in groster}
+    check("GameManager: obaj gracze maja rozne CONG", len(set(congs.values())) == 2 and 0 not in congs.values())
+    mesh = gamemgr.update_mesh_connection(
+        cfg, "guest", [("GID ", tdf.VARINT, gid), ("STAT", tdf.VARINT, 2),
+                       ("TCG ", tdf.OBJID, ids.connection_group_objid_for("host"))], lookup)
+    done = [o for o in mesh if o[1].startswith("NotifyPlayerJoinCompleted guest")]
+    check("GameManager: mesh guest->host konczy dolaczanie gracza", len(done) >= 1)
+    gamemgr.reset()
+
+
 def run_selftest() -> int:
     logging.getLogger("fifa17srv").setLevel(logging.WARNING)
     tmp = Path(tempfile.mkdtemp(prefix="fifa17srv_test_"))
@@ -232,6 +272,8 @@ def run_selftest() -> int:
     check("TDF tag round trip", all(tdf.decode_tag(tdf.encode_tag(t)) == t for t in ("NAME", "ZZZZ", "AB", "X1", "1234")))
     fields, reached, err = tdf.decode_partial(b"\xff\xff\xff\xff")
     check("TDF decoder rejects garbage without crashing", err is not None and fields == [])
+
+    _gamemgr_checks()
 
     psrv.stop()
     rsrv.stop()

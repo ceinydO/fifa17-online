@@ -15,6 +15,26 @@ game itself.
 > source of truth for what is confirmed, what is a guess, and what is still broken — so a fresh
 > session (human or Claude) does not have to re-derive it from scratch.
 
+## Latest session: 2026-10-09 (analiza dekompilatorem, przebudowa GameManager)
+
+Dekompilacja EBOOT (Ghidra headless) pokazala konkretne bledy naszych odpowiedzi GameManager; wszystkie
+poprawione w kodzie (`gamemgr.py`, `ids.py`, `messaging.py`), NIEZWERYFIKOWANE na zywym kliencie:
+- **Unia REAS (GameSetupReason)**: w FIFA 17 skladowe maja rozne tagi (DLSC, IJGS, IMSC, MMSC, RDSC), a numer
+  na drucie = pozycja w tablicy posortowanej po tagu (DLSC=0, IJGS=1, IMSC=2, MMSC=3, RDSC=4). Dekoder unii
+  (0xcd0bc8) przy niezgodnym tagu zostawia unie PUSTA. Wczesniej slalismy tag VALU (FIFA 14), a zaproszonemu
+  numer 2 (= IndirectMatchmaking!). Teraz host: DLSC{DCTX=0}, zaproszony: IJGS{RPVC=0}.
+- **CONG (id grupy polaczen)**: klient trzyma punkty koncowe sieci pod kluczem ReplicatedGamePlayer.CONG i NIE
+  laczy sie z graczem, ktorego CONG rowna sie jego wlasnemu (0xc5e22c, 0xc5e958, 0xc5eaec). Mielismy CONG=0 u
+  wszystkich => brak ruchu UDP miedzy graczami. Teraz kazdy gracz ma unikalne CONG (= jego BlazeId), takie
+  samo w rosterze, HostInfo {CONG,CSID,HPID,HSES,HSLT} i w UserAuthenticated.CGID (ObjectId (30722,2,id)).
+- **Unikalne ID graczy** (ids.py) zamiast wspolnego LOCAL_USER_ID z widokiem "per klient".
+- Pola TimeValue (TIME) maja typ TDF 11; usuniete HSES z ReplicatedGameData; dodane GPVH/SEED/UUID/MNCP/PSAS.
+- Sukces createGame u hosta przychodzi dopiero z ODPOWIEDZIA na finalizeGameCreation (0xc6bf74) -- serwer
+  odpowiada pusto bez bledu (OK). Potem FE wysyla zaproszenie przez NP: 'gses' musi miec biezaca sesje gry,
+  potem sceNpBasicSendMessageGui z id gry (0x302454). W logach hosta tego wywolania nadal nie ma.
+- Nowe: Authentication::listEntitlements (ACTIVE na grupe), Messaging (skrzynka), removePlayer/destroyGame/joinGame,
+  NotifyUserAdded dla graczy gry. Przelaczniki w config.py (`gm_*`, `serve_entitlements`, `serve_messaging`).
+
 ## Latest session: 2026-10-08 (read this first)
 
 **Goal:** get two real players (two PCs, RPCS3, Radmin VPN) past "Sending match invite and creating a

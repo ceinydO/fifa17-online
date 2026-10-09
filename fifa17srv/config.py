@@ -25,25 +25,33 @@ class Config:
     # capture). If the game ignores it or refuses, switch to True.
     blaze_secure: bool = False
 
-    # EKSPERYMENT (2026-10-08): po NotifyGameSetup wyslij obu graczom dodatkowe powiadomienia
-    # GameManager (NotifyGamePlayerStateChange 0x74 dla kazdego gracza + NotifyGameStateChange 0x64),
-    # bo host po createGame nic juz nie wysyla i wisi na "Sending match invite...". Ksztalty z Impulsum14
-    # (FIFA14), niezweryfikowane na FIFA 17 -- dlatego da sie to wylaczyc w config.json.
-    gm_followups: bool = True
-    # Stan graczy w liscie NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient sam laczy sie z rownymi i
-    # zglasza updateMeshConnection), 4 = ACTIVE_CONNECTED (stare zachowanie: klienci nie otwierali
-    # zadnych polaczen P2P, bo uznawali wszystkich za juz polaczonych).
-    gm_initial_player_state: int = 2
-    # NotifyPlayerJoining dla hosta o zaproszonym graczu (0x0015).
-    gm_send_player_joining: bool = True
-    # Hipoteza (2026-10-08): gra startuje w GSTA=INITIALIZING(1) i dopiero po finalizeGameCreation
-    # serwer przesuwa ja do PRE_GAME(130) (NotifyGameStateChange). False = PRE_GAME od razu (stare).
+    # GameManager (patrz gamemgr.py). Wszystkie przelaczniki to eksperymenty -- zadnego nie zweryfikowano jeszcze
+    # na zywym kliencie, kazdy mozna wylaczyc w config.json (zob. TEST_PLAN.md).
+    gm_enabled: bool = True
+    # Gra startuje w GSTA=INITIALIZING(1); PRE_GAME(130) idzie dopiero po finalizeGameCreation hosta.
     gm_deferred_pregame: bool = True
-    # Realistyczny przebieg (2026-10-08): w createGame host dostaje setup tylko ze soba (stan CONNECTED);
-    # zaproszony dostaje NotifyGameSetup dopiero po finalizeGameCreation hosta (wraz z
-    # NotifyPlatformHostInitialized), a host dostaje wtedy NotifyPlayerJoining. False = stary przebieg
-    # (obaj od razu w setupie).
+    # Tryb "faithful": host dostaje NotifyGameSetup tylko ze soba, zaproszony dopiero po finalizeGameCreation hosta
+    # (jak przy dolaczaniu do istniejacej gry); False = obaj od razu w setupie.
     gm_faithful_flow: bool = True
+    # Stan hosta w pierwszym NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient sam zglasza updateMeshConnection i
+    # dopiero wtedy dostaje ACTIVE_CONNECTED + NotifyPlayerJoinCompleted), 4 = ACTIVE_CONNECTED od razu.
+    gm_host_initial_state: int = 2
+    # Stan dolaczajacego gracza po NotifyGameSetup: 2 = ACTIVE_CONNECTING (klient laczy sie z hostem P2P).
+    gm_initial_player_state: int = 2
+    # NotifyPlayerJoining dla hosta o dolaczajacym graczu.
+    gm_send_player_joining: bool = True
+    # Rozsylanie advanceGameState/setGameAttributes/setPlayerAttributes do wszystkich graczy gry.
+    gm_followups: bool = True
+    # Zaproszony gracz dostaje gre jako IndirectJoinGameSetupContext (IJGS) -- jedyna skladowa REAS, przy ktorej
+    # SDK klienta bez wlasnego createGame/joinGame doprowadza dolaczenie do konca. False = DatalessSetupContext/JOIN.
+    gm_indirect_join: bool = True
+    # Tagi i numery skladowych unii REAS jak w FIFA 17 (DLSC/IJGS, numer = pozycja po tagu). False = ksztalt FIFA 14.
+    gm_fifa17_union_tags: bool = True
+
+    # Authentication::listEntitlements: jedna AKTYWNA pozycja na kazda zadana grupe (jak serwer FIFA 14), zamiast pustej
+    # odpowiedzi; Messaging: skrzynka wiadomosci/zaproszen (messaging.py).
+    serve_entitlements: bool = True
+    serve_messaging: bool = True
 
     # Usluga POW / EASFC (patrz pow_stub.py): serwer podaje klientowi adresy w konfiguracji
     # FIFA_POW_URL / FIFA_POW_CONTENT_SERVER_URL i nasluchuje na tych portach (tylko nagrywa zadania).
